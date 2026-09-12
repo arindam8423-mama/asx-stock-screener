@@ -41,9 +41,11 @@ def run_backtest(
 ) -> BacktestResult:
     """Run a simple long-only, one-position-per-ticker backtest.
 
-    Signals are evaluated on the close of a session and trades execute at the
-    following session's open, avoiding same-bar look-ahead. Positions are sized
-    as a percentage of initial capital. Brokerage is charged on both sides.
+    Signals are evaluated on the close of a session and trades entered from
+    those signals execute at the following session's open. Stop-loss and
+    take-profit levels are evaluated against the current session's high/low.
+    Brokerage is charged separately from the position allocation, so the
+    requested position-size percentage represents the intended share exposure.
     """
     config = config or BacktestConfig()
     required = {"date", "ticker", "open", "high", "low", "close"}
@@ -69,7 +71,9 @@ def run_backtest(
                     execution_index = i + 1
                     entry_price = float(history.loc[execution_index, "open"])
                     allocated = config.initial_capital * config.position_size_pct / 100
-                    shares = max((allocated - config.buy_brokerage) / entry_price, 0.0)
+                    # Brokerage is an additional transaction cost, not deducted
+                    # from the requested position exposure.
+                    shares = max(allocated / entry_price, 0.0)
                     if shares > 0:
                         entry_index = execution_index
                         entry_date = history.loc[execution_index, "date"].date()
@@ -79,10 +83,9 @@ def run_backtest(
             close_price = float(history.loc[i, "close"])
             high_price = float(history.loc[i, "high"])
             low_price = float(history.loc[i, "low"])
-            change_pct = (close_price / entry_price - 1) * 100
-
             reason = None
             exit_price = None
+
             if config.stop_loss_pct is not None and low_price <= entry_price * (1 - config.stop_loss_pct / 100):
                 reason, exit_price = "stop_loss", entry_price * (1 - config.stop_loss_pct / 100)
             elif config.take_profit_pct is not None and high_price >= entry_price * (1 + config.take_profit_pct / 100):
