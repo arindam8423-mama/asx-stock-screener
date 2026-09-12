@@ -68,32 +68,32 @@ def _extract_code_change_table(table: pd.DataFrame) -> pd.DataFrame:
     # The ASX page presents old/new details as grouped table headings. Pandas
     # can flatten those headings differently across HTML revisions, so accept
     # both labelled and positional five-column tables.
-    if len(frame.columns) == 5:
-        columns = list(frame.columns)
-        date_col = next((c for c in columns if "as of" in c), columns[0])
-        old_cols = [c for c in columns if "old" in c]
-        new_cols = [c for c in columns if "new" in c]
-        if len(old_cols) >= 2 and len(new_cols) >= 2:
-            result = pd.DataFrame(
-                {
-                    "effective_date": frame[date_col],
-                    "old_ticker": frame[old_cols[0]],
-                    "old_name": frame[old_cols[1]],
-                    "new_ticker": frame[new_cols[0]],
-                    "new_name": frame[new_cols[1]],
-                }
-            )
-        else:
-            result = frame.iloc[:, :5].copy()
-            result.columns = [
-                "effective_date",
-                "old_ticker",
-                "old_name",
-                "new_ticker",
-                "new_name",
-            ]
-    else:
+    if len(frame.columns) != 5:
         return pd.DataFrame(columns=CODE_CHANGE_COLUMNS)
+
+    columns = list(frame.columns)
+    date_col = next((c for c in columns if "as of" in c), columns[0])
+    old_cols = [c for c in columns if "old" in c]
+    new_cols = [c for c in columns if "new" in c]
+    if len(old_cols) >= 2 and len(new_cols) >= 2:
+        result = pd.DataFrame(
+            {
+                "effective_date": frame[date_col],
+                "old_ticker": frame[old_cols[0]],
+                "old_name": frame[old_cols[1]],
+                "new_ticker": frame[new_cols[0]],
+                "new_name": frame[new_cols[1]],
+            }
+        )
+    else:
+        result = frame.iloc[:, :5].copy()
+        result.columns = [
+            "effective_date",
+            "old_ticker",
+            "old_name",
+            "new_ticker",
+            "new_name",
+        ]
 
     result["effective_date"] = _parse_effective_dates(result["effective_date"])
     for column in ("old_ticker", "new_ticker"):
@@ -109,7 +109,11 @@ def _extract_code_change_table(table: pd.DataFrame) -> pd.DataFrame:
 
 def parse_asx_code_changes_html(html: str) -> pd.DataFrame:
     """Parse ASX code/name-change tables from saved HTML content."""
-    tables = pd.read_html(StringIO(html))
+    try:
+        tables = pd.read_html(StringIO(html))
+    except (ImportError, ValueError):
+        return pd.DataFrame(columns=CODE_CHANGE_COLUMNS)
+
     parsed = [_extract_code_change_table(table) for table in tables]
     parsed = [table for table in parsed if not table.empty]
     if not parsed:
