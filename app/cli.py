@@ -16,6 +16,7 @@ from app.data.market_data import download_history, load_universe
 from app.data.security_master import build_security_master, save_security_master
 from app.data.storage import MarketDataStore
 from app.data.universe import download_asx_isin_directory, equity_universe, save_universe
+from app.research import download_test_universe, run_momentum_research
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +28,17 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--start", required=True, help="Inclusive start date, e.g. 2021-01-01")
     download.add_argument("--end", required=True, help="Exclusive end date, e.g. 2026-01-01")
     download.add_argument("--continue-on-error", action="store_true")
+
+    test_download = subparsers.add_parser(
+        "download-test-data", help="Download historical prices for the fixed 15-stock research basket"
+    )
+    test_download.add_argument("--start", required=True)
+    test_download.add_argument("--end", required=True)
+
+    momentum = subparsers.add_parser(
+        "backtest-momentum", help="Run the first breakout-momentum strategy on the test basket"
+    )
+    momentum.add_argument("--prices-dir", type=Path, default=None)
 
     universe = subparsers.add_parser(
         "download-universe", help="Download the current ASX equity candidate universe"
@@ -81,6 +93,36 @@ def download_command(args: argparse.Namespace) -> int:
 
     print(f"Completed with {failures} failure(s)")
     return 1 if failures else 0
+
+
+def download_test_data_command(args: argparse.Namespace) -> int:
+    settings.ensure_data_dirs()
+    failures = download_test_universe(args.start, args.end)
+    print(f"Test-universe download completed with {failures} failure(s)")
+    return 1 if failures else 0
+
+
+def backtest_momentum_command(args: argparse.Namespace) -> int:
+    research = run_momentum_research(args.prices_dir)
+    result = research["overall"]
+    print("Breakout momentum research")
+    print(f"Trades: {len(result.trades)}")
+    print(f"Final capital: ${result.final_capital:,.2f}")
+    print(f"Total return: {result.total_return_pct:.2f}%")
+    print(f"Win rate: {result.win_rate_pct:.2f}%")
+    print(f"Profit factor: {result.profit_factor:.2f}")
+    print(f"Max drawdown: {result.max_drawdown_pct:.2f}%")
+    print(f"Average trade: {result.average_trade_pct:.2f}%")
+    print(f"Median trade: {result.median_trade_pct:.2f}%")
+    print(f"Average holding days: {result.average_holding_days:.2f}")
+    print("\nBy cap group")
+    for group, metrics in research["by_group"].items():
+        print(
+            f"{group:>5}: trades={metrics['trades']}, "
+            f"net_pnl=${metrics['net_pnl']:,.2f}, "
+            f"win_rate={metrics['win_rate_pct']:.2f}%"
+        )
+    return 0
 
 
 def download_universe_command(args: argparse.Namespace) -> int:
@@ -143,6 +185,10 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.command == "download-prices":
         return download_command(args)
+    if args.command == "download-test-data":
+        return download_test_data_command(args)
+    if args.command == "backtest-momentum":
+        return backtest_momentum_command(args)
     if args.command == "download-universe":
         return download_universe_command(args)
     if args.command == "build-security-master":
