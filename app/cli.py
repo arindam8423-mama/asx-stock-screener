@@ -3,7 +3,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import pandas as pd
+
 from app.config import settings
+from app.data.historical_reference import (
+    download_asx_code_changes,
+    load_delistings,
+    save_code_changes,
+    save_delistings,
+)
 from app.data.market_data import download_history, load_universe
 from app.data.security_master import build_security_master, save_security_master
 from app.data.storage import MarketDataStore
@@ -37,6 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     master.add_argument("--universe", type=Path, default=None)
     master.add_argument("--output", type=Path, default=None)
+
+    code_changes = subparsers.add_parser(
+        "download-code-changes", help="Download ASX historical code/name changes"
+    )
+    code_changes.add_argument("--output", type=Path, default=None)
+
+    delistings = subparsers.add_parser(
+        "import-delistings", help="Import an externally obtained historical delisting CSV"
+    )
+    delistings.add_argument("--input", type=Path, required=True)
+    delistings.add_argument("--output", type=Path, default=None)
 
     ingest = subparsers.add_parser("ingest", help="Create/refresh the local DuckDB prices view")
     ingest.add_argument("--prices-dir", type=Path, default=None)
@@ -86,14 +105,29 @@ def build_security_master_command(args: argparse.Namespace) -> int:
     settings.ensure_data_dirs()
     universe_path = args.universe or (settings.data_dir / "universe.csv")
     output = args.output or (settings.data_dir / "security_master.csv")
-
-    import pandas as pd
-
     universe = pd.read_csv(universe_path)
     master = build_security_master(universe)
     save_security_master(master, output)
     print(f"Saved {len(master):,} securities to {output}")
     print("Listing/delisting dates remain unknown until historical reference data is added")
+    return 0
+
+
+def download_code_changes_command(args: argparse.Namespace) -> int:
+    settings.ensure_data_dirs()
+    output = args.output or (settings.data_dir / "code_changes.csv")
+    changes = download_asx_code_changes()
+    save_code_changes(changes, output)
+    print(f"Saved {len(changes):,} ASX code/name changes to {output}")
+    return 0
+
+
+def import_delistings_command(args: argparse.Namespace) -> int:
+    settings.ensure_data_dirs()
+    output = args.output or (settings.data_dir / "delistings.csv")
+    delisted = load_delistings(args.input)
+    save_delistings(delisted, output)
+    print(f"Imported {len(delisted):,} historical delistings to {output}")
     return 0
 
 
@@ -113,6 +147,10 @@ def main() -> int:
         return download_universe_command(args)
     if args.command == "build-security-master":
         return build_security_master_command(args)
+    if args.command == "download-code-changes":
+        return download_code_changes_command(args)
+    if args.command == "import-delistings":
+        return import_delistings_command(args)
     if args.command == "ingest":
         return ingest_command(args)
     raise AssertionError(f"Unhandled command: {args.command}")
