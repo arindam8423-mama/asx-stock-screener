@@ -6,11 +6,22 @@ from pathlib import Path
 from app.config import settings
 from app.data.market_data import download_history, load_universe
 from app.data.storage import MarketDataStore
+from app.data.universe import download_asx_isin_directory, save_universe
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ASX stock screener tools")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    universe = subparsers.add_parser(
+        "download-universe", help="Download the current ASX ISIN directory"
+    )
+    universe.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/universe.csv"),
+        help="Output CSV path (default: data/universe.csv)",
+    )
 
     download = subparsers.add_parser("download-prices", help="Download historical ASX OHLCV data")
     download.add_argument("--universe", type=Path, required=True)
@@ -22,6 +33,14 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--prices-dir", type=Path, default=None)
 
     return parser
+
+
+def universe_command(args: argparse.Namespace) -> int:
+    universe = download_asx_isin_directory()
+    path = save_universe(universe, args.output)
+    print(f"Saved {len(universe):,} ASX instruments to {path}")
+    print("instrument_type is intentionally left as 'unknown' until security-type metadata is added")
+    return 0
 
 
 def download_command(args: argparse.Namespace) -> int:
@@ -54,6 +73,8 @@ def ingest_command(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.command == "download-universe":
+        return universe_command(args)
     if args.command == "download-prices":
         return download_command(args)
     if args.command == "ingest":
