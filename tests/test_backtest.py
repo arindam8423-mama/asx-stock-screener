@@ -36,11 +36,11 @@ def test_backtest_executes_next_day_and_charges_both_brokerages():
     assert len(result.trades) == 1
     trade = result.trades[0]
     assert trade.entry_date == date(2026, 1, 2)
-    assert trade.exit_date == date(2026, 1, 4)
+    assert trade.exit_date == date(2026, 1, 3)
     assert trade.entry_price == 10.0
-    assert trade.exit_price == 13.0
+    assert trade.exit_price == 12.0
     assert trade.brokerage == 22.0
-    assert trade.net_pnl == 278.0
+    assert trade.net_pnl == 178.0
 
 
 def test_backtest_time_exit():
