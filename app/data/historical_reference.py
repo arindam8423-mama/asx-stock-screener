@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -38,6 +39,24 @@ def _normalise_code(value: object) -> str:
     return _normalise_text(value).upper().replace(".AX", "")
 
 
+def _parse_effective_dates(values: pd.Series) -> pd.Series:
+    """Parse ASX date labels, including the page's day-month labels without a year."""
+    text = values.map(_normalise_text)
+    parsed = pd.to_datetime(text, errors="coerce", format="mixed")
+
+    missing = parsed.isna() & text.ne("")
+    if missing.any():
+        current_year = datetime.now().year
+        with_year = text.loc[missing] + f"-{current_year}"
+        parsed.loc[missing] = pd.to_datetime(
+            with_year,
+            errors="coerce",
+            format="%d-%b-%Y",
+        )
+
+    return parsed.dt.normalize()
+
+
 def _extract_code_change_table(table: pd.DataFrame) -> pd.DataFrame:
     """Convert one ASX code-change HTML table to the stable schema."""
     if table.empty:
@@ -48,8 +67,8 @@ def _extract_code_change_table(table: pd.DataFrame) -> pd.DataFrame:
 
     # The ASX page presents old/new details as grouped table headings. Pandas
     # can flatten those headings differently across HTML revisions, so accept
-    # both the current labels and positional four-column tables.
-    if len(frame.columns) >= 5:
+    # both labelled and positional five-column tables.
+    if len(frame.columns) == 5:
         columns = list(frame.columns)
         date_col = next((c for c in columns if "as of" in c), columns[0])
         old_cols = [c for c in columns if "old" in c]
@@ -65,20 +84,18 @@ def _extract_code_change_table(table: pd.DataFrame) -> pd.DataFrame:
                 }
             )
         else:
-            return pd.DataFrame(columns=CODE_CHANGE_COLUMNS)
-    elif len(frame.columns) == 5:
-        result = frame.iloc[:, :5].copy()
-        result.columns = [
-            "effective_date",
-            "old_ticker",
-            "old_name",
-            "new_ticker",
-            "new_name",
-        ]
+            result = frame.iloc[:, :5].copy()
+            result.columns = [
+                "effective_date",
+                "old_ticker",
+                "old_name",
+                "new_ticker",
+                "new_name",
+            ]
     else:
         return pd.DataFrame(columns=CODE_CHANGE_COLUMNS)
 
-    result["effective_date"] = pd.to_datetime(result["effective_date"], errors="coerce").dt.normalize()
+    result["effective_date"] = _parse_effective_dates(result["effective_date"])
     for column in ("old_ticker", "new_ticker"):
         result[column] = result[column].map(_normalise_code)
     for column in ("old_name", "new_name"):
