@@ -12,6 +12,7 @@ dependencies = [
     "pandas>=2.2,<3.0",
     "pyarrow>=17,<22",
     "pydantic-settings>=2.4,<3.0",
+    "xlrd>=2.0,<3.0",
     "yfinance>=0.2.40,<2.0",
 ]
 
