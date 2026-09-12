@@ -65,9 +65,6 @@ def _extract_code_change_table(table: pd.DataFrame) -> pd.DataFrame:
     frame = table.copy()
     frame.columns = [_normalise_text(column).lower() for column in frame.columns]
 
-    # The ASX page presents old/new details as grouped table headings. Pandas
-    # can flatten those headings differently across HTML revisions, so accept
-    # both labelled and positional five-column tables.
     if len(frame.columns) != 5:
         return pd.DataFrame(columns=CODE_CHANGE_COLUMNS)
 
@@ -118,12 +115,10 @@ def parse_asx_code_changes_html(html: str) -> pd.DataFrame:
     parsed = [table for table in parsed if not table.empty]
     if not parsed:
         return pd.DataFrame(columns=CODE_CHANGE_COLUMNS)
-    return (
-        pd.concat(parsed, ignore_index=True)
-        .drop_duplicates()
-        .sort_values(["effective_date", "old_ticker", "new_ticker"])
-        .reset_index(drop=True)
-    )
+
+    # Preserve source order. The ASX page publishes the most recent changes
+    # first, and yearless dates should not be re-ordered across a year boundary.
+    return pd.concat(parsed, ignore_index=True).drop_duplicates().reset_index(drop=True)
 
 
 def download_asx_code_changes(url: str = ASX_CODE_CHANGES_URL) -> pd.DataFrame:
