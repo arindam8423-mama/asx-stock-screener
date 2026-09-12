@@ -14,6 +14,14 @@ class AlwaysEnterOnce:
         return index == 2
 
 
+class EnterOnlyOnce:
+    def entry_signal(self, history: pd.DataFrame, index: int) -> bool:
+        return index == 0
+
+    def exit_signal(self, history: pd.DataFrame, entry_index: int, index: int) -> bool:
+        return False
+
+
 def test_backtest_executes_next_day_and_charges_both_brokerages():
     prices = pd.DataFrame(
         {
@@ -57,7 +65,7 @@ def test_backtest_time_exit():
     )
     result = run_backtest(
         prices,
-        AlwaysEnterOnce(),
+        EnterOnlyOnce(),
         TEST_UNIVERSE,
         BacktestConfig(initial_capital=1_000, position_size_pct=50, max_holding_days=2),
     )
