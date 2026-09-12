@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.config import settings
 from app.data.market_data import download_history, load_universe
+from app.data.security_master import build_security_master, save_security_master
 from app.data.storage import MarketDataStore
 from app.data.universe import download_asx_isin_directory, equity_universe, save_universe
 
@@ -29,6 +30,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path for the complete unfiltered ASX instrument directory",
     )
+
+    master = subparsers.add_parser(
+        "build-security-master",
+        help="Build the security-master foundation from a normalized universe CSV",
+    )
+    master.add_argument("--universe", type=Path, default=None)
+    master.add_argument("--output", type=Path, default=None)
 
     ingest = subparsers.add_parser("ingest", help="Create/refresh the local DuckDB prices view")
     ingest.add_argument("--prices-dir", type=Path, default=None)
@@ -74,6 +82,21 @@ def download_universe_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def build_security_master_command(args: argparse.Namespace) -> int:
+    settings.ensure_data_dirs()
+    universe_path = args.universe or (settings.data_dir / "universe.csv")
+    output = args.output or (settings.data_dir / "security_master.csv")
+
+    import pandas as pd
+
+    universe = pd.read_csv(universe_path)
+    master = build_security_master(universe)
+    save_security_master(master, output)
+    print(f"Saved {len(master):,} securities to {output}")
+    print("Listing/delisting dates remain unknown until historical reference data is added")
+    return 0
+
+
 def ingest_command(args: argparse.Namespace) -> int:
     prices_dir = args.prices_dir or settings.prices_dir
     store = MarketDataStore(settings.duckdb_path)
@@ -88,6 +111,8 @@ def main() -> int:
         return download_command(args)
     if args.command == "download-universe":
         return download_universe_command(args)
+    if args.command == "build-security-master":
+        return build_security_master_command(args)
     if args.command == "ingest":
         return ingest_command(args)
     raise AssertionError(f"Unhandled command: {args.command}")
