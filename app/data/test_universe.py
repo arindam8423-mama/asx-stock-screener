@@ -7,7 +7,7 @@ TEST_UNIVERSE: dict[str, list[str]] = {
 }
 
 
-def test_universe() -> dict[str, list[str]]:
+def get_test_universe() -> dict[str, list[str]]:
     """Return a copy of the fixed 15-stock research basket."""
     return {cap: tickers.copy() for cap, tickers in TEST_UNIVERSE.items()}
 
