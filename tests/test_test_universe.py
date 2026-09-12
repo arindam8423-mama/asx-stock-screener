@@ -1,4 +1,4 @@
-from app.data.test_universe import TEST_UNIVERSE, all_test_tickers, test_universe
+from app.data.test_universe import TEST_UNIVERSE, all_test_tickers, get_test_universe
 
 
 def test_fixed_research_universe_has_three_groups_of_five():
@@ -9,6 +9,6 @@ def test_fixed_research_universe_has_three_groups_of_five():
 
 
 def test_universe_returns_copy():
-    copied = test_universe()
+    copied = get_test_universe()
     copied["large"].append("TEST")
     assert "TEST" not in TEST_UNIVERSE["large"]
