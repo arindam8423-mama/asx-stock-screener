@@ -6,22 +6,12 @@ from pathlib import Path
 from app.config import settings
 from app.data.market_data import download_history, load_universe
 from app.data.storage import MarketDataStore
-from app.data.universe import download_asx_isin_directory, save_universe
+from app.data.universe import download_asx_isin_directory, equity_universe, save_universe
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ASX stock screener tools")
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    universe = subparsers.add_parser(
-        "download-universe", help="Download the current ASX ISIN directory"
-    )
-    universe.add_argument(
-        "--output",
-        type=Path,
-        default=Path("data/universe.csv"),
-        help="Output CSV path (default: data/universe.csv)",
-    )
 
     download = subparsers.add_parser("download-prices", help="Download historical ASX OHLCV data")
     download.add_argument("--universe", type=Path, required=True)
@@ -29,18 +19,21 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("--end", required=True, help="Exclusive end date, e.g. 2026-01-01")
     download.add_argument("--continue-on-error", action="store_true")
 
+    universe = subparsers.add_parser(
+        "download-universe", help="Download the current ASX equity candidate universe"
+    )
+    universe.add_argument("--output", type=Path, default=None)
+    universe.add_argument(
+        "--raw-output",
+        type=Path,
+        default=None,
+        help="Optional path for the complete unfiltered ASX instrument directory",
+    )
+
     ingest = subparsers.add_parser("ingest", help="Create/refresh the local DuckDB prices view")
     ingest.add_argument("--prices-dir", type=Path, default=None)
 
     return parser
-
-
-def universe_command(args: argparse.Namespace) -> int:
-    universe = download_asx_isin_directory()
-    path = save_universe(universe, args.output)
-    print(f"Saved {len(universe):,} ASX instruments to {path}")
-    print("instrument_type is intentionally left as 'unknown' until security-type metadata is added")
-    return 0
 
 
 def download_command(args: argparse.Namespace) -> int:
@@ -63,6 +56,24 @@ def download_command(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def download_universe_command(args: argparse.Namespace) -> int:
+    settings.ensure_data_dirs()
+    raw_output = args.raw_output
+    output = args.output or (settings.data_dir / "universe.csv")
+
+    universe = download_asx_isin_directory()
+    candidates = equity_universe(universe)
+
+    if raw_output is not None:
+        save_universe(universe, raw_output)
+        print(f"Saved {len(universe):,} raw ASX instruments to {raw_output}")
+
+    save_universe(candidates, output)
+    print(f"Saved {len(candidates):,} equity candidates to {output}")
+    print(f"Excluded {len(universe) - len(candidates):,} non-equity/other instruments")
+    return 0
+
+
 def ingest_command(args: argparse.Namespace) -> int:
     prices_dir = args.prices_dir or settings.prices_dir
     store = MarketDataStore(settings.duckdb_path)
@@ -73,10 +84,10 @@ def ingest_command(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.command == "download-universe":
-        return universe_command(args)
     if args.command == "download-prices":
         return download_command(args)
+    if args.command == "download-universe":
+        return download_universe_command(args)
     if args.command == "ingest":
         return ingest_command(args)
     raise AssertionError(f"Unhandled command: {args.command}")
