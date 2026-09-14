@@ -3,7 +3,7 @@ from __future__ import annotations
 TEST_UNIVERSE: dict[str, list[str]] = {
     "large": ["CBA", "BHP", "CSL", "WBC", "NAB"],
     "mid": ["MQG", "WES", "WOW", "REA", "TCL"],
-    "small": ["ALU", "IEL", "BAP", "NXT", "TNE"],
+    "small": ["IDX", "IEL", "BAP", "NXT", "TNE"],
 }
 
 
