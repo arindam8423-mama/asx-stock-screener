@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +17,13 @@ from app.data.market_data import download_history, load_universe
 from app.data.security_master import build_security_master, save_security_master
 from app.data.storage import MarketDataStore
 from app.data.universe import download_asx_isin_directory, equity_universe, save_universe
-from app.research import download_test_universe, run_momentum_research, run_strategy_comparison
+from app.research import (
+    download_test_universe,
+    optimize_mean_reversion,
+    run_momentum_research,
+    run_strategy_comparison,
+    run_train_test_benchmarks,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,6 +51,26 @@ def build_parser() -> argparse.ArgumentParser:
         "compare-strategies", help="Run all research strategy families side by side on the test basket"
     )
     comparison.add_argument("--prices-dir", type=Path, default=None)
+
+    validation = subparsers.add_parser(
+        "validate-strategies", help="Evaluate all fixed strategy benchmarks on the train/test split"
+    )
+    validation.add_argument("--prices-dir", type=Path, default=None)
+    validation.add_argument("--train-start", type=date.fromisoformat, default=date(2021, 1, 1))
+    validation.add_argument("--train-end", type=date.fromisoformat, default=date(2024, 12, 1))
+    validation.add_argument("--test-start", type=date.fromisoformat, default=date(2025, 1, 1))
+    validation.add_argument("--test-end", type=date.fromisoformat, default=date(2025, 12, 31))
+
+    optimize = subparsers.add_parser(
+        "optimize-mean-reversion", help="Optimise mean reversion on train data and validate finalists out of sample"
+    )
+    optimize.add_argument("--prices-dir", type=Path, default=None)
+    optimize.add_argument("--train-start", type=date.fromisoformat, default=date(2021, 1, 1))
+    optimize.add_argument("--train-end", type=date.fromisoformat, default=date(2024, 12, 1))
+    optimize.add_argument("--test-start", type=date.fromisoformat, default=date(2025, 1, 1))
+    optimize.add_argument("--test-end", type=date.fromisoformat, default=date(2025, 12, 31))
+    optimize.add_argument("--top-n", type=int, default=10)
+    optimize.add_argument("--min-trades", type=int, default=20)
 
     universe = subparsers.add_parser(
         "download-universe", help="Download the current ASX equity candidate universe"
@@ -164,6 +191,68 @@ def compare_strategies_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_validation_row(name: str, train, test) -> None:
+    print(
+        f"{name:<20} | {len(train.trades):>6} | {train.total_return_pct:>7.2f}% | "
+        f"{train.profit_factor:>5.2f} | {train.max_drawdown_pct:>7.2f}% || "
+        f"{len(test.trades):>6} | {test.total_return_pct:>7.2f}% | "
+        f"{test.profit_factor:>5.2f} | {test.max_drawdown_pct:>7.2f}%"
+    )
+
+
+def validate_strategies_command(args: argparse.Namespace) -> int:
+    results = run_train_test_benchmarks(
+        args.prices_dir,
+        args.train_start,
+        args.train_end,
+        args.test_start,
+        args.test_end,
+    )
+    print("Train/test validation — fixed strategy benchmarks")
+    print(f"Train: {args.train_start} to {args.train_end} (purged before test)")
+    print(f"Test:  {args.test_start} to {args.test_end}")
+    print("\nStrategy             | Train trades | Train ret | Train PF | Train DD || Test trades | Test ret | Test PF | Test DD")
+    print("-" * 122)
+    for name, result in results.items():
+        _print_validation_row(name, result["train"], result["test"])
+    return 0
+
+
+def optimize_mean_reversion_command(args: argparse.Namespace) -> int:
+    research = optimize_mean_reversion(
+        args.prices_dir,
+        args.train_start,
+        args.train_end,
+        args.test_start,
+        args.test_end,
+        args.top_n,
+        args.min_trades,
+    )
+    print("Mean-reversion parameter optimisation")
+    print(f"Grid combinations: {research['grid_size']}")
+    print(f"Eligible train candidates: {research['eligible_candidates']} (minimum {research['min_trades']} trades)")
+    print(f"Train: {research['train_start']} to {research['train_end']} (purged before test)")
+    print(f"Test:  {research['test_start']} to {research['test_end']}")
+    print("\nRanked finalists — train vs untouched test")
+    print(
+        "Rank | Lookback | StdDev | RSI | Threshold | MaxHold | "
+        "Train Trades | Train Ret | Train PF | Test Trades | Test Ret | Test PF | Test DD"
+    )
+    print("-" * 145)
+    for rank, candidate in enumerate(research["validation"], start=1):
+        p = candidate["parameters"]
+        train = candidate["train"]
+        test = candidate["test"]
+        print(
+            f"{rank:>4} | {p.lookback_days:>8} | {p.stddevs:>6.1f} | {p.rsi_period:>3} | "
+            f"{p.rsi_threshold:>9.1f} | {p.max_holding_days:>7} | {len(train.trades):>11} | "
+            f"{train.total_return_pct:>9.2f}% | {train.profit_factor:>8.2f} | "
+            f"{len(test.trades):>11} | {test.total_return_pct:>8.2f}% | "
+            f"{test.profit_factor:>7.2f} | {test.max_drawdown_pct:>7.2f}%"
+        )
+    return 0
+
+
 def download_universe_command(args: argparse.Namespace) -> int:
     settings.ensure_data_dirs()
     raw_output = args.raw_output
@@ -230,6 +319,10 @@ def main() -> int:
         return backtest_momentum_command(args)
     if args.command == "compare-strategies":
         return compare_strategies_command(args)
+    if args.command == "validate-strategies":
+        return validate_strategies_command(args)
+    if args.command == "optimize-mean-reversion":
+        return optimize_mean_reversion_command(args)
     if args.command == "download-universe":
         return download_universe_command(args)
     if args.command == "build-security-master":
