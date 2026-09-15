@@ -8,6 +8,7 @@ from app.research_cross_sectional import (
     optimize_cross_sectional_momentum,
     optimize_volatility_adjusted_momentum,
     run_cross_sectional_benchmark,
+    run_trend_filtered_benchmark,
     run_volatility_adjusted_benchmark,
 )
 
@@ -15,18 +16,10 @@ from app.research_cross_sectional import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Cross-sectional momentum research tools")
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    for name, help_text in (
-        ("benchmark", "Run the fixed 20-day cross-sectional momentum benchmark"),
-        ("vol-adjusted-benchmark", "Run the fixed volatility-adjusted momentum benchmark"),
-    ):
+    for name, help_text in (("benchmark", "Run raw momentum benchmark"), ("trend-filtered-benchmark", "Run momentum with trend filter"), ("vol-adjusted-benchmark", "Run volatility-adjusted momentum benchmark")):
         command = subparsers.add_parser(name, help=help_text)
         command.add_argument("--prices-dir", type=Path, default=None)
-
-    for name, help_text in (
-        ("optimize", "Optimise raw cross-sectional momentum on train data and validate out of sample"),
-        ("vol-adjusted-optimize", "Optimise volatility-adjusted momentum on train data and validate out of sample"),
-    ):
+    for name, help_text in (("optimize", "Optimise momentum + trend filters"), ("vol-adjusted-optimize", "Optimise volatility-adjusted momentum")):
         command = subparsers.add_parser(name, help=help_text)
         command.add_argument("--prices-dir", type=Path, default=None)
         command.add_argument("--train-start", type=date.fromisoformat, default=date(2021, 1, 1))
@@ -38,77 +31,67 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _print_benchmark(research: dict[str, object], volatility_adjusted: bool = False) -> None:
+def _print_benchmark(research: dict[str, object], mode: str = "raw") -> None:
     p = research["parameters"]
-    result = research["overall"]
-    label = "Volatility-adjusted cross-sectional momentum benchmark" if volatility_adjusted else "Cross-sectional momentum benchmark"
-    print(label)
-    if volatility_adjusted:
-        print(f"Parameters: {p.lookback_days}-day return / {p.volatility_days}-day volatility, top {p.top_n}, {p.max_holding_days}-day scheduled rebalance")
+    r = research["overall"]
+    print("Trend-filtered cross-sectional momentum benchmark" if mode == "trend" else "Volatility-adjusted cross-sectional momentum benchmark" if mode == "vol" else "Cross-sectional momentum benchmark")
+    if mode == "trend":
+        print(f"Parameters: {p.lookback_days}-day return, top {p.top_n}, {p.max_holding_days}-day rebalance, filter={p.trend_filter}")
+    elif mode == "vol":
+        print(f"Parameters: {p.lookback_days}-day return / {p.volatility_days}-day volatility, top {p.top_n}, {p.max_holding_days}-day rebalance")
     else:
-        print(f"Parameters: {p.lookback_days}-day relative strength, top {p.top_n}, {p.max_holding_days}-day scheduled rebalance")
-    print("Assumptions: $10,000 initial capital, 10% of current equity per position, $11 buy + $11 sell brokerage")
-    print()
-    print(f"Trades: {len(result.trades)}")
-    print(f"Final capital: ${result.final_capital:,.2f}")
-    print(f"Total return: {result.total_return_pct:.2f}%")
-    print(f"Win rate: {result.win_rate_pct:.2f}%")
-    print(f"Profit factor: {result.profit_factor:.2f}")
-    print(f"Max drawdown: {result.max_drawdown_pct:.2f}%")
-    print(f"Average trade: {result.average_trade_pct:.2f}%")
-    print(f"Average holding days: {result.average_holding_days:.2f}")
+        print(f"Parameters: {p.lookback_days}-day relative strength, top {p.top_n}, {p.max_holding_days}-day rebalance")
+    print("Assumptions: $10,000 initial capital, 10% current equity per position, $11 buy + $11 sell brokerage\n")
+    print(f"Trades: {len(r.trades)}")
+    print(f"Final capital: ${r.final_capital:,.2f}")
+    print(f"Total return: {r.total_return_pct:.2f}%")
+    print(f"Win rate: {r.win_rate_pct:.2f}%")
+    print(f"Profit factor: {r.profit_factor:.2f}")
+    print(f"Max drawdown: {r.max_drawdown_pct:.2f}%")
+    print(f"Average trade: {r.average_trade_pct:.2f}%")
+    print(f"Average holding days: {r.average_holding_days:.2f}")
+    if mode == "trend":
+        print("\nTrend filter pass rates")
+        for name, rate in research["trend_filter_pass_rates"].items():
+            print(f"{name}: {rate:.2f}%")
     print("\nBy cap group")
-    for group, metrics in research["by_group"].items():
-        print(f"{group:>5}: trades={metrics['trades']}, net_pnl=${metrics['net_pnl']:,.2f}, win_rate={metrics['win_rate_pct']:.2f}%")
+    for group, m in research["by_group"].items():
+        print(f"{group:>5}: trades={m['trades']}, net_pnl=${m['net_pnl']:,.2f}, win_rate={m['win_rate_pct']:.2f}%")
 
 
 def _print_optimization(research: dict[str, object], volatility_adjusted: bool = False) -> None:
-    print("Volatility-adjusted cross-sectional momentum parameter optimisation" if volatility_adjusted else "Cross-sectional momentum parameter optimisation")
+    print("Volatility-adjusted cross-sectional momentum parameter optimisation" if volatility_adjusted else "Cross-sectional momentum + trend-filter parameter optimisation")
     print("NOTE: finalists are selected using train data only; test results are out of sample.")
     print(f"Grid combinations: {research['grid_size']}")
     print(f"Eligible train candidates: {research['eligible_candidates']} (minimum {research['min_trades']} trades)")
-    print(f"Train: {research['train_start']} to {research['train_end']} (purged before test)")
+    print(f"Train: {research['train_start']} to {research['train_end']}")
     print(f"Test:  {research['test_start']} to {research['test_end']}")
-    header = "Rank | Lookback | VolDays | Top N | MaxHold | Train Trades | Train Ret | Train PF | Test Trades | Test Ret | Test PF | Test DD" if volatility_adjusted else "Rank | Lookback | Top N | MaxHold | Train Trades | Train Ret | Train PF | Test Trades | Test Ret | Test PF | Test DD"
-    print("\n" + header)
-    print("-" * 135)
-    for rank, candidate in enumerate(research["validation"], start=1):
-        p = candidate["parameters"]
-        train = candidate["train"]
-        test = candidate["test"]
-        if volatility_adjusted:
-            print(
-                f"{rank:>4} | {p.lookback_days:>8} | {p.volatility_days:>7} | {p.top_n:>5} | {p.max_holding_days:>7} | "
-                f"{len(train.trades):>11} | {train.total_return_pct:>9.2f}% | {train.profit_factor:>8.2f} | "
-                f"{len(test.trades):>11} | {test.total_return_pct:>8.2f}% | {test.profit_factor:>7.2f} | {test.max_drawdown_pct:>7.2f}%"
-            )
-        else:
-            print(
-                f"{rank:>4} | {p.lookback_days:>8} | {p.top_n:>5} | {p.max_holding_days:>7} | "
-                f"{len(train.trades):>11} | {train.total_return_pct:>9.2f}% | {train.profit_factor:>8.2f} | "
-                f"{len(test.trades):>11} | {test.total_return_pct:>8.2f}% | {test.profit_factor:>7.2f} | {test.max_drawdown_pct:>7.2f}%"
-            )
+    if not volatility_adjusted:
+        print("\nTrend filter pass rates")
+        for name, rate in research["trend_filter_pass_rates"].items():
+            print(f"{name}: {rate:.2f}%")
+    if volatility_adjusted:
+        print("\nRank | Lookback | VolDays | Top N | Hold | Train Trades | Train Ret | Train PF | Test Trades | Test Ret | Test PF | Test DD")
+    else:
+        print("\nRank | Lookback | Top N | Hold | Trend Filter | Train Trades | Train Ret | Train PF | Test Trades | Test Ret | Test PF | Test DD")
+    for rank, c in enumerate(research["validation"], 1):
+        p, train, test = c["parameters"], c["train"], c["test"]
+        extra = f"{p.volatility_days:>7} | " if volatility_adjusted else f"{p.trend_filter:>45} | "
+        print(f"{rank:>4} | {p.lookback_days:>8} | {extra}{p.top_n:>5} | {p.max_holding_days:>4} | {len(train.trades):>11} | {train.total_return_pct:>9.2f}% | {train.profit_factor:>8.2f} | {len(test.trades):>11} | {test.total_return_pct:>8.2f}% | {test.profit_factor:>7.2f} | {test.max_drawdown_pct:>7.2f}%")
 
 
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "benchmark":
         _print_benchmark(run_cross_sectional_benchmark(args.prices_dir))
-        return 0
-    if args.command == "vol-adjusted-benchmark":
-        _print_benchmark(run_volatility_adjusted_benchmark(args.prices_dir), volatility_adjusted=True)
-        return 0
-    if args.command == "optimize":
-        research = optimize_cross_sectional_momentum(
-            args.prices_dir, args.train_start, args.train_end, args.test_start, args.test_end, args.top_n_results, args.min_trades
-        )
-        _print_optimization(research)
-        return 0
-
-    research = optimize_volatility_adjusted_momentum(
-        args.prices_dir, args.train_start, args.train_end, args.test_start, args.test_end, args.top_n_results, args.min_trades
-    )
-    _print_optimization(research, volatility_adjusted=True)
+    elif args.command == "trend-filtered-benchmark":
+        _print_benchmark(run_trend_filtered_benchmark(args.prices_dir), "trend")
+    elif args.command == "vol-adjusted-benchmark":
+        _print_benchmark(run_volatility_adjusted_benchmark(args.prices_dir), "vol")
+    elif args.command == "optimize":
+        _print_optimization(optimize_cross_sectional_momentum(args.prices_dir, args.train_start, args.train_end, args.test_start, args.test_end, args.top_n_results, args.min_trades))
+    else:
+        _print_optimization(optimize_volatility_adjusted_momentum(args.prices_dir, args.train_start, args.train_end, args.test_start, args.test_end, args.top_n_results, args.min_trades), True)
     return 0
 
 
