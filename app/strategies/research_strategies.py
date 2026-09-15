@@ -15,7 +15,7 @@ class MeanReversionStrategy:
     rsi_threshold: float = 30.0
 
     def entry_signal(self, history: pd.DataFrame, index: int) -> bool:
-        minimum = max(self.lookback_days, self.rsi_period) + 1
+        minimum = max(self.lookback_days, self.rsi_period)
         if index < minimum:
             return False
         close = history["close"].astype(float)
@@ -73,7 +73,7 @@ class BreakoutVariantStrategy:
     max_atr_pct: float = 8.0
 
     def entry_signal(self, history: pd.DataFrame, index: int) -> bool:
-        minimum = max(self.lookback_days, self.volume_lookback_days, self.atr_period) + 1
+        minimum = max(self.lookback_days, self.volume_lookback_days, self.atr_period)
         if index < minimum:
             return False
         prior = history.iloc[index - self.lookback_days : index]
