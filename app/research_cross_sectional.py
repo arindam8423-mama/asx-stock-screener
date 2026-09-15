@@ -39,7 +39,7 @@ def _momentum_ranks(prices: pd.DataFrame, lookback_days: int) -> pd.DataFrame:
     return ranks
 
 
-def _result_from_trades(trades: list[Trade]) -> BacktestResult:
+def _result_from_trades(trades: list[Trade], final_capital: float | None = None) -> BacktestResult:
     returns = pd.Series([trade.return_pct for trade in trades], dtype=float)
     profits = sum(max(trade.net_pnl, 0) for trade in trades)
     losses = sum(-min(trade.net_pnl, 0) for trade in trades)
@@ -52,12 +52,13 @@ def _result_from_trades(trades: list[Trade]) -> BacktestResult:
         peak = max(peak, equity)
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - equity) / peak * 100)
-    final_capital = max(0.0, initial_capital + sum(trade.net_pnl for trade in trades))
+    if final_capital is None:
+        final_capital = max(0.0, initial_capital + sum(trade.net_pnl for trade in trades))
     return BacktestResult(
         trades=trades,
         initial_capital=initial_capital,
-        final_capital=final_capital,
-        total_return_pct=(final_capital / initial_capital - 1) * 100,
+        final_capital=max(0.0, final_capital),
+        total_return_pct=(max(0.0, final_capital) / initial_capital - 1) * 100,
         win_rate_pct=(returns.gt(0).mean() * 100) if len(returns) else 0.0,
         profit_factor=(profits / losses) if losses else float("inf") if profits else 0.0,
         max_drawdown_pct=max_drawdown,
@@ -156,9 +157,6 @@ def run_cross_sectional_momentum(
         if not target or cash <= buy_brokerage:
             return
 
-        # The portfolio is flat at a scheduled rebalance, so current cash is
-        # current equity. Allocate 10% of that equity to each target, with the
-        # buy brokerage included inside the allocation.
         allocation = cash * position_size_pct / 100
         for ticker in target:
             if ticker in positions or cash <= buy_brokerage:
@@ -238,19 +236,13 @@ def run_cross_sectional_momentum(
                     brokerage=buy_brokerage + sell_brokerage,
                     net_pnl=net_pnl,
                     return_pct=return_pct,
-                    holding_days=date_to_index[final_timestamp] - date_to_index[pd.Timestamp(position["entry_timestamp"])]
-                    ,
+                    holding_days=date_to_index[final_timestamp] - date_to_index[pd.Timestamp(position["entry_timestamp"])],
                     exit_reason="end_of_data",
                 )
             )
             del positions[ticker]
 
-    result = _result_from_trades(trades)
-    # Cash is the authoritative final account value because every open position
-    # has been closed above. Clamp only against floating-point noise.
-    result.final_capital = max(0.0, cash)
-    result.total_return_pct = (result.final_capital / initial_capital - 1) * 100
-    return result
+    return _result_from_trades(trades, final_capital=cash)
 
 
 def _grid() -> list[CrossSectionalMomentumParameters]:
