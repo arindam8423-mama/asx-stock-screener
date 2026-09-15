@@ -98,12 +98,22 @@ class BreakoutVariantStrategy:
 
 def _rsi(close: pd.Series, period: int) -> pd.Series:
     delta = close.diff()
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
+    gains = delta.clip(lower=0.0)
+    losses = -delta.clip(upper=0.0)
     average_gain = gains.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
     average_loss = losses.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    relative_strength = average_gain / average_loss.replace(0, pd.NA)
-    return 100 - (100 / (1 + relative_strength))
+
+    # Handle the two degenerate RSI cases explicitly:
+    # no losses => RSI 100; no gains => RSI 0. If both are zero, RSI is neutral (50).
+    rsi = pd.Series(index=close.index, dtype=float)
+    positive_loss = average_loss > 0
+    positive_gain = average_gain > 0
+    normal = positive_loss & positive_gain
+    rsi.loc[normal] = 100 - (100 / (1 + average_gain.loc[normal] / average_loss.loc[normal]))
+    rsi.loc[positive_gain & ~positive_loss] = 100.0
+    rsi.loc[~positive_gain & positive_loss] = 0.0
+    rsi.loc[~positive_gain & ~positive_loss] = 50.0
+    return rsi
 
 
 def _atr(history: pd.DataFrame, period: int) -> pd.Series:
