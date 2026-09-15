@@ -8,8 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from app.backtest.models import BacktestResult, Trade
-from app.config import settings
-from app.data.test_universe import TEST_UNIVERSE, all_test_tickers
+from app.data.test_universe import TEST_UNIVERSE
 from app.research import load_test_prices
 
 
@@ -73,66 +72,90 @@ def run_cross_sectional_momentum(
     entry_start_date: date | None = None,
     entry_end_date: date | None = None,
 ) -> BacktestResult:
-    """Backtest long-only cross-sectional momentum.
+    """Backtest a long-only cross-sectional momentum portfolio.
 
-    On each session, stocks are ranked by trailing return over the configured
-    lookback. The top N stocks generate signals using only information known at
-    that close. Entry occurs at the following session's open. Positions exit at
-    the configured maximum holding period close. Each position uses 10% of the
-    fixed $10,000 research capital and pays $11 buy + $11 sell brokerage.
+    At each signal close, stocks are ranked by trailing return. The top N define
+    the target portfolio. Any required exits and new entries are executed at the
+    following session's open, so the ranking never uses future information.
+
+    Unlike the original ticker-by-ticker implementation, this is a true
+    portfolio construction model: there can never be more than ``top_n`` open
+    positions. A position is replaced when its stock leaves the top N, or when
+    its maximum holding period is reached. Each position uses 10% of the fixed
+    $10,000 research capital and pays $11 buy + $11 sell brokerage.
     """
     if parameters.lookback_days < 1 or parameters.top_n < 1 or parameters.max_holding_days < 1:
         raise ValueError("Momentum parameters must be positive")
 
     frame = prices.copy()
     frame["date"] = pd.to_datetime(frame["date"])
-    frame = frame.sort_values(["ticker", "date"]).reset_index(drop=True)
+    frame = frame.sort_values(["date", "ticker"]).reset_index(drop=True)
     ranks = _momentum_ranks(frame, parameters.lookback_days)
     initial_capital, position_size_pct, buy_brokerage, sell_brokerage = _backtest_config_values()
     allocated = initial_capital * position_size_pct / 100
     trades: list[Trade] = []
 
-    for ticker in sorted(frame["ticker"].unique()):
-        history = frame[frame["ticker"] == ticker].reset_index(drop=True)
-        entry_index: int | None = None
-        entry_price = 0.0
-        shares = 0.0
-        entry_date = None
+    by_ticker = {
+        ticker: history.sort_values("date").reset_index(drop=True)
+        for ticker, history in frame.groupby("ticker", sort=True)
+    }
+    common_dates = sorted(frame["date"].unique())
+    date_to_index = {pd.Timestamp(value): index for index, value in enumerate(common_dates)}
 
-        for i in range(len(history) - 1):
-            signal_date = history.loc[i, "date"].date()
-            rank_value = ranks.loc[history.loc[i, "date"], ticker]
-            eligible = pd.notna(rank_value) and float(rank_value) <= parameters.top_n
-            in_window = (
-                (entry_start_date is None or signal_date >= entry_start_date)
-                and (entry_end_date is None or signal_date <= entry_end_date)
-            )
+    # Open positions contain execution-day information. They are deliberately
+    # tracked at portfolio level so the target top-N count is enforced globally.
+    positions: dict[str, dict[str, object]] = {}
 
-            if entry_index is None:
-                if eligible and in_window:
-                    execution_index = i + 1
-                    entry_price = float(history.loc[execution_index, "open"])
-                    shares = max(allocated / entry_price, 0.0)
-                    if shares > 0:
-                        entry_index = execution_index
-                        entry_date = history.loc[execution_index, "date"].date()
+    def _row(ticker: str, timestamp: pd.Timestamp) -> pd.Series | None:
+        history = by_ticker[ticker]
+        matches = history.index[history["date"] == timestamp]
+        if len(matches) == 0:
+            return None
+        return history.loc[matches[0]]
+
+    for signal_timestamp in common_dates[:-1]:
+        signal_timestamp = pd.Timestamp(signal_timestamp)
+        signal_date = signal_timestamp.date()
+        next_timestamp = pd.Timestamp(common_dates[date_to_index[signal_timestamp] + 1])
+
+        # Signals are only allowed inside the requested entry window. Once a
+        # train/test window ends, existing positions can still be closed, but
+        # no new positions are opened from signals outside that window.
+        in_window = (
+            (entry_start_date is None or signal_date >= entry_start_date)
+            and (entry_end_date is None or signal_date <= entry_end_date)
+        )
+
+        rank_row = ranks.loc[signal_timestamp] if signal_timestamp in ranks.index else pd.Series(dtype=float)
+        ranked = rank_row.dropna().sort_values().index.tolist()
+        target = set(ranked[: parameters.top_n]) if in_window else set()
+
+        # First close positions that are no longer wanted or have reached the
+        # maximum holding period. Execution occurs at the next session open.
+        for ticker in list(positions):
+            position = positions[ticker]
+            entry_timestamp = pd.Timestamp(position["entry_timestamp"])
+            holding_days = date_to_index[next_timestamp] - date_to_index[entry_timestamp]
+            if ticker in target and holding_days < parameters.max_holding_days:
                 continue
 
-            holding_days = i - entry_index
-            if holding_days < parameters.max_holding_days:
+            exit_row = _row(ticker, next_timestamp)
+            if exit_row is None:
                 continue
-
-            exit_price = float(history.loc[i, "close"])
+            entry_price = float(position["entry_price"])
+            shares = float(position["shares"])
+            exit_price = float(exit_row["open"])
             gross_pnl = (exit_price - entry_price) * shares
             brokerage = buy_brokerage + sell_brokerage
             net_pnl = gross_pnl - brokerage
             return_pct = net_pnl / (entry_price * shares + buy_brokerage) * 100
+            exit_date = next_timestamp.date()
             trades.append(
                 Trade(
                     ticker=ticker,
                     cap_group=_cap_group(ticker),
-                    entry_date=entry_date,
-                    exit_date=history.loc[i, "date"].date(),
+                    entry_date=position["entry_date"],
+                    exit_date=exit_date,
                     entry_price=entry_price,
                     exit_price=exit_price,
                     shares=shares,
@@ -141,37 +164,68 @@ def run_cross_sectional_momentum(
                     net_pnl=net_pnl,
                     return_pct=return_pct,
                     holding_days=holding_days,
-                    exit_reason="time",
+                    exit_reason="time" if ticker in target else "rebalance",
                 )
             )
-            entry_index = None
-            entry_date = None
-            shares = 0.0
+            del positions[ticker]
 
-        if entry_index is not None:
-            i = len(history) - 1
-            exit_price = float(history.loc[i, "close"])
-            gross_pnl = (exit_price - entry_price) * shares
-            brokerage = buy_brokerage + sell_brokerage
-            net_pnl = gross_pnl - brokerage
-            return_pct = net_pnl / (entry_price * shares + buy_brokerage) * 100
-            trades.append(
-                Trade(
-                    ticker=ticker,
-                    cap_group=_cap_group(ticker),
-                    entry_date=entry_date,
-                    exit_date=history.loc[i, "date"].date(),
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    shares=shares,
-                    gross_pnl=gross_pnl,
-                    brokerage=brokerage,
-                    net_pnl=net_pnl,
-                    return_pct=return_pct,
-                    holding_days=i - entry_index,
-                    exit_reason="end_of_data",
-                )
+        # Then fill vacant portfolio slots with the strongest stocks. Entries
+        # are also executed at the next open, after the signal close.
+        available_slots = max(parameters.top_n - len(positions), 0)
+        if available_slots:
+            for ticker in ranked:
+                if available_slots == 0:
+                    break
+                if ticker in positions:
+                    continue
+                if ticker not in target:
+                    break
+                entry_row = _row(ticker, next_timestamp)
+                if entry_row is None:
+                    continue
+                entry_price = float(entry_row["open"])
+                shares = max(allocated / entry_price, 0.0)
+                if shares <= 0:
+                    continue
+                positions[ticker] = {
+                    "entry_timestamp": next_timestamp,
+                    "entry_date": next_timestamp.date(),
+                    "entry_price": entry_price,
+                    "shares": shares,
+                }
+                available_slots -= 1
+
+    # Close anything still open at the final available close. This is an
+    # end-of-data liquidation rather than a new signal/entry.
+    final_timestamp = pd.Timestamp(common_dates[-1])
+    for ticker, position in list(positions.items()):
+        exit_row = _row(ticker, final_timestamp)
+        if exit_row is None:
+            continue
+        entry_price = float(position["entry_price"])
+        shares = float(position["shares"])
+        exit_price = float(exit_row["close"])
+        gross_pnl = (exit_price - entry_price) * shares
+        brokerage = buy_brokerage + sell_brokerage
+        net_pnl = gross_pnl - brokerage
+        return_pct = net_pnl / (entry_price * shares + buy_brokerage) * 100
+        trades.append(
+            Trade(
+                ticker=ticker,
+                cap_group=_cap_group(ticker),
+                entry_date=position["entry_date"],
+                exit_date=final_timestamp.date(),
+                entry_price=entry_price,
+                exit_price=exit_price,
+                shares=shares,
+                gross_pnl=gross_pnl,
+                brokerage=brokerage,
+                net_pnl=net_pnl,
+                return_pct=return_pct,
+                holding_days=date_to_index[final_timestamp] - date_to_index[pd.Timestamp(position["entry_timestamp"])],
+                exit_reason="end_of_data",
             )
+        )
 
     return _result_from_trades(trades)
 
