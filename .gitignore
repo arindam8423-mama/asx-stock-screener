@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.DS_Store
+
+# Local research data
+data/prices/
+data/duckdb/
+data/*.duckdb
+data/*.db
