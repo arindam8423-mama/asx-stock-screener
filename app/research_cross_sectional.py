@@ -82,7 +82,37 @@ def _apply_trend_filter(ranks: pd.DataFrame, eligibility: pd.DataFrame) -> pd.Da
     return filtered
 
 
-def _result_from_trades(trades: list[Trade], final_capital: float | None = None) -> BacktestResult:
+def _mark_to_market_max_drawdown(prices: pd.DataFrame, trades: list[Trade]) -> float:
+    """Calculate max drawdown from daily portfolio equity, including open-position mark-to-market."""
+    if not trades:
+        return 0.0
+    initial_capital, _, buy_brokerage, sell_brokerage = _backtest_config_values()
+    frame = prices.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    closes = frame.pivot(index="date", columns="ticker", values="close").sort_index()
+    cash = initial_capital
+    equity_curve: list[float] = []
+    for current_date in pd.DatetimeIndex(closes.index):
+        current_day = current_date.date()
+        for trade in trades:
+            if trade.entry_date == current_day:
+                cash -= trade.shares * trade.entry_price + buy_brokerage
+            if trade.exit_date == current_day:
+                cash += trade.shares * trade.exit_price - sell_brokerage
+        holdings_value = 0.0
+        for trade in trades:
+            if trade.entry_date <= current_day < trade.exit_date and trade.ticker in closes.columns:
+                close = closes.at[current_date, trade.ticker]
+                if pd.notna(close):
+                    holdings_value += trade.shares * float(close)
+        equity_curve.append(max(0.0, cash + holdings_value))
+    equity = pd.Series(equity_curve, index=closes.index, dtype=float)
+    peak = equity.cummax()
+    drawdown = ((peak - equity) / peak.replace(0.0, pd.NA) * 100).fillna(0.0)
+    return float(drawdown.max()) if len(drawdown) else 0.0
+
+
+def _result_from_trades(trades: list[Trade], final_capital: float | None = None, prices: pd.DataFrame | None = None) -> BacktestResult:
     returns = pd.Series([trade.return_pct for trade in trades], dtype=float)
     profits = sum(max(trade.net_pnl, 0) for trade in trades)
     losses = sum(-min(trade.net_pnl, 0) for trade in trades)
@@ -95,6 +125,8 @@ def _result_from_trades(trades: list[Trade], final_capital: float | None = None)
         peak = max(peak, equity)
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - equity) / peak * 100)
+    if prices is not None:
+        max_drawdown = _mark_to_market_max_drawdown(prices, trades)
     if final_capital is None:
         final_capital = max(0.0, initial_capital + sum(trade.net_pnl for trade in trades))
     return BacktestResult(
@@ -290,4 +322,4 @@ def run_cross_sectional_momentum(prices: pd.DataFrame, parameters: CrossSectiona
             trades.append(Trade(ticker=ticker, cap_group=_cap_group(ticker), entry_date=position["entry_date"], exit_date=final_timestamp.date(), entry_price=entry_price, exit_price=exit_price, shares=shares, gross_pnl=gross_pnl, brokerage=buy_brokerage + sell_brokerage, net_pnl=net_pnl, return_pct=return_pct, holding_days=date_to_index[final_timestamp] - date_to_index[pd.Timestamp(position["entry_timestamp"])], exit_reason="end_of_data"))
             del positions[ticker]
 
-    return _result_from_trades(trades, final_capital=cash)
+    return _result_from_trades(trades, final_capital=cash, prices=prices_frame)
