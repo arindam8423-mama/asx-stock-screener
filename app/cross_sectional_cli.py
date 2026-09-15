@@ -4,6 +4,7 @@ import argparse
 from datetime import date
 from pathlib import Path
 
+from app.cross_sectional_walk_forward import run_walk_forward
 from app.research_cross_sectional import (
     optimize_cross_sectional_momentum,
     optimize_volatility_adjusted_momentum,
@@ -28,6 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--test-end", type=date.fromisoformat, default=date(2025, 12, 31))
         command.add_argument("--top-n-results", type=int, default=10)
         command.add_argument("--min-trades", type=int, default=20)
+    walk = subparsers.add_parser("walk-forward", help="Run expanding-window walk-forward validation")
+    walk.add_argument("--prices-dir", type=Path, default=None)
+    walk.add_argument("--min-trades", type=int, default=20)
     return parser
 
 
@@ -80,6 +84,21 @@ def _print_optimization(research: dict[str, object], volatility_adjusted: bool =
         print(f"{rank:>4} | {p.lookback_days:>8} | {extra}{p.top_n:>5} | {p.max_holding_days:>4} | {len(train.trades):>11} | {train.total_return_pct:>9.2f}% | {train.profit_factor:>8.2f} | {len(test.trades):>11} | {test.total_return_pct:>8.2f}% | {test.profit_factor:>7.2f} | {test.max_drawdown_pct:>7.2f}%")
 
 
+def _print_walk_forward(research: dict[str, object]) -> None:
+    print("Expanding-window cross-sectional momentum walk-forward validation")
+    print("Each window selects parameters on train data only, then evaluates the selected parameters on the next calendar year.")
+    print(f"Grid combinations per window: {research['grid_size']}")
+    print(f"Minimum train trades: {research['min_trades']}\n")
+    print("Window | Selected parameters | Train Ret | Train PF | Test Trades | Test Ret | Test PF | Test DD")
+    for index, row in enumerate(research["windows"], 1):
+        if "parameters" not in row:
+            print(f"{index} | no eligible candidate")
+            continue
+        p, train, test = row["parameters"], row["train"], row["test"]
+        label = f"{p.lookback_days}d/top{p.top_n}/hold{p.max_holding_days}/{p.trend_filter}"
+        print(f"{row['train_start']}→{row['train_end']} / {row['test_start']}→{row['test_end']} | {label} | {train.total_return_pct:>8.2f}% | {train.profit_factor:>8.2f} | {len(test.trades):>11} | {test.total_return_pct:>8.2f}% | {test.profit_factor:>7.2f} | {test.max_drawdown_pct:>7.2f}%")
+
+
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "benchmark":
@@ -90,8 +109,10 @@ def main() -> int:
         _print_benchmark(run_volatility_adjusted_benchmark(args.prices_dir), "vol")
     elif args.command == "optimize":
         _print_optimization(optimize_cross_sectional_momentum(args.prices_dir, args.train_start, args.train_end, args.test_start, args.test_end, args.top_n_results, args.min_trades))
+    elif args.command == "walk-forward":
+        _print_walk_forward(run_walk_forward(args.prices_dir, args.min_trades))
     else:
-        _print_optimization(optimize_volatility_adjusted_momentum(args.prices_dir, args.train_start, args.train_end, args.test_start, args.test_end, args.top_n_results, args.min_trades), True)
+        _print_optimization(optimize_volatility_adjusted_momentum(args.prices_dir, args.top_n_results, args.min_trades), True)
     return 0
 
 
