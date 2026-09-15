@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import date
+from itertools import product
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +18,21 @@ from app.strategies import (
     MeanReversionStrategy,
     TrendFollowingStrategy,
 )
+
+
+@dataclass(frozen=True)
+class MeanReversionParameters:
+    lookback_days: int
+    stddevs: float
+    rsi_period: int
+    rsi_threshold: float
+    max_holding_days: int
+
+
+@dataclass(frozen=True)
+class OptimizationCandidate:
+    parameters: MeanReversionParameters
+    result: BacktestResult
 
 
 def download_test_universe(start: str, end: str, output_dir: Path | None = None) -> int:
@@ -74,10 +92,21 @@ def strategy_definitions() -> dict[str, object]:
     }
 
 
+def _backtest_config(max_holding_days: int = 20, **kwargs) -> BacktestConfig:
+    return BacktestConfig(
+        initial_capital=10_000,
+        position_size_pct=10,
+        max_holding_days=max_holding_days,
+        buy_brokerage=11,
+        sell_brokerage=11,
+        **kwargs,
+    )
+
+
 def run_strategy_comparison(prices_dir: Path | None = None) -> dict[str, dict[str, object]]:
     """Run all research strategies using identical backtest assumptions."""
     prices = load_test_prices(prices_dir)
-    config = BacktestConfig(initial_capital=10_000, position_size_pct=10, max_holding_days=20)
+    config = _backtest_config()
     comparison: dict[str, dict[str, object]] = {}
     for name, strategy in strategy_definitions().items():
         result = run_backtest(prices, strategy, TEST_UNIVERSE, config)
@@ -91,6 +120,142 @@ def run_momentum_research(prices_dir: Path | None = None) -> dict[str, object]:
         prices,
         BreakoutMomentumStrategy(lookback_days=20, volume_lookback_days=20),
         TEST_UNIVERSE,
-        BacktestConfig(initial_capital=10_000, position_size_pct=10, max_holding_days=20),
+        _backtest_config(),
     )
     return {"overall": result, "by_group": _group_metrics(result)}
+
+
+def _mean_reversion_grid() -> list[MeanReversionParameters]:
+    """Return a deliberately bounded grid for the first optimisation pass."""
+    return [
+        MeanReversionParameters(*values)
+        for values in product(
+            (10, 15, 20, 30),  # lookback_days
+            (1.5, 2.0, 2.5),  # Bollinger-style standard deviations
+            (14,),  # RSI period; keep fixed initially to reduce degrees of freedom
+            (25.0, 30.0, 35.0),  # RSI threshold
+            (5, 10, 15, 20),  # max holding days
+        )
+    ]
+
+
+def _mean_reversion_strategy(parameters: MeanReversionParameters) -> MeanReversionStrategy:
+    return MeanReversionStrategy(
+        lookback_days=parameters.lookback_days,
+        stddevs=parameters.stddevs,
+        rsi_period=parameters.rsi_period,
+        rsi_threshold=parameters.rsi_threshold,
+    )
+
+
+def _candidate_sort_key(candidate: OptimizationCandidate) -> tuple[float, float, float, int]:
+    result = candidate.result
+    profit_factor = result.profit_factor
+    # Infinite PF is allowed, but the minimum-trade filter below prevents a
+    # one-trade/no-loss result from winning the search by itself.
+    pf_rank = profit_factor if profit_factor != float("inf") else 1_000.0
+    return (pf_rank, result.total_return_pct, -result.max_drawdown_pct, len(result.trades))
+
+
+def optimize_mean_reversion(
+    prices_dir: Path | None = None,
+    train_start: date = date(2021, 1, 1),
+    train_end: date = date(2024, 12, 1),
+    test_start: date = date(2025, 1, 1),
+    test_end: date = date(2025, 12, 31),
+    top_n: int = 10,
+    min_trades: int = 20,
+) -> dict[str, object]:
+    """Optimise mean reversion on train data and validate the finalists out of sample.
+
+    The train end intentionally leaves a purge window before the test start so
+    the 20-day maximum holding period cannot create train trades that remain
+    open into the test period. The full price history is still supplied to the
+    backtester so test indicators have legitimate pre-test warm-up data.
+    """
+    if train_start >= train_end or train_end >= test_start or test_start > test_end:
+        raise ValueError("Invalid train/test date ranges")
+    if top_n < 1 or min_trades < 1:
+        raise ValueError("top_n and min_trades must be positive")
+
+    prices = load_test_prices(prices_dir)
+    grid = _mean_reversion_grid()
+    train_candidates: list[OptimizationCandidate] = []
+
+    for parameters in grid:
+        strategy = _mean_reversion_strategy(parameters)
+        result = run_backtest(
+            prices,
+            strategy,
+            TEST_UNIVERSE,
+            _backtest_config(
+                max_holding_days=parameters.max_holding_days,
+                entry_start_date=train_start,
+                entry_end_date=train_end,
+            ),
+        )
+        if len(result.trades) >= min_trades:
+            train_candidates.append(OptimizationCandidate(parameters, result))
+
+    train_candidates.sort(key=_candidate_sort_key, reverse=True)
+    finalists = train_candidates[:top_n]
+
+    validation: list[dict[str, object]] = []
+    for candidate in finalists:
+        test_result = run_backtest(
+            prices,
+            _mean_reversion_strategy(candidate.parameters),
+            TEST_UNIVERSE,
+            _backtest_config(
+                max_holding_days=candidate.parameters.max_holding_days,
+                entry_start_date=test_start,
+                entry_end_date=test_end,
+            ),
+        )
+        validation.append(
+            {
+                "parameters": candidate.parameters,
+                "train": candidate.result,
+                "test": test_result,
+            }
+        )
+
+    return {
+        "grid_size": len(grid),
+        "eligible_candidates": len(train_candidates),
+        "top_n": top_n,
+        "min_trades": min_trades,
+        "train_start": train_start,
+        "train_end": train_end,
+        "test_start": test_start,
+        "test_end": test_end,
+        "validation": validation,
+    }
+
+
+def run_train_test_benchmarks(
+    prices_dir: Path | None = None,
+    train_start: date = date(2021, 1, 1),
+    train_end: date = date(2024, 12, 1),
+    test_start: date = date(2025, 1, 1),
+    test_end: date = date(2025, 12, 31),
+) -> dict[str, dict[str, BacktestResult]]:
+    """Evaluate the four fixed strategies on the same untouched train/test split."""
+    prices = load_test_prices(prices_dir)
+    results: dict[str, dict[str, BacktestResult]] = {}
+    for name, strategy in strategy_definitions().items():
+        results[name] = {
+            "train": run_backtest(
+                prices,
+                strategy,
+                TEST_UNIVERSE,
+                _backtest_config(entry_start_date=train_start, entry_end_date=train_end),
+            ),
+            "test": run_backtest(
+                prices,
+                strategy,
+                TEST_UNIVERSE,
+                _backtest_config(entry_start_date=test_start, entry_end_date=test_end),
+            ),
+        }
+    return results
