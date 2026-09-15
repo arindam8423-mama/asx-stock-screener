@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Protocol
 
 import pandas as pd
@@ -24,6 +25,8 @@ class BacktestConfig:
     sell_brokerage: float = settings.sell_brokerage_aud
     stop_loss_pct: float | None = None
     take_profit_pct: float | None = None
+    entry_start_date: date | None = None
+    entry_end_date: date | None = None
 
 
 def _cap_group(ticker: str, groups: dict[str, list[str]]) -> str:
@@ -46,6 +49,11 @@ def run_backtest(
     take-profit levels are evaluated against the current session's high/low.
     Brokerage is charged separately from the position allocation, so the
     requested position-size percentage represents the intended share exposure.
+
+    ``entry_start_date`` and ``entry_end_date`` restrict which signal dates can
+    open new trades while preserving the full supplied history for indicators.
+    This is used by train/test validation so the test period can use prior
+    price history as indicator warm-up without allowing pre-test entries.
     """
     config = config or BacktestConfig()
     required = {"date", "ticker", "open", "high", "low", "close"}
@@ -66,8 +74,13 @@ def run_backtest(
         entry_date = None
 
         for i in range(len(history) - 1):
+            signal_date = history.loc[i, "date"].date()
             if entry_index is None:
-                if strategy.entry_signal(history, i):
+                if (
+                    (config.entry_start_date is None or signal_date >= config.entry_start_date)
+                    and (config.entry_end_date is None or signal_date <= config.entry_end_date)
+                    and strategy.entry_signal(history, i)
+                ):
                     execution_index = i + 1
                     entry_price = float(history.loc[execution_index, "open"])
                     allocated = config.initial_capital * config.position_size_pct / 100
