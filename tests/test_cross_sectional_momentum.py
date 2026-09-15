@@ -54,6 +54,44 @@ def test_cross_sectional_backtest_enters_after_rank_signal():
     assert trade.entry_price == 12.0
 
 
+def test_cross_sectional_holds_positions_until_scheduled_rebalance():
+    dates = pd.date_range("2025-01-01", periods=9, freq="D")
+    rows = []
+    closes = {
+        # CBA ranks first initially, then BHP overtakes it while the first
+        # holding period is still active. The position must not churn daily.
+        "CBA": [10.0, 10.0, 12.0, 12.0, 12.0, 8.0, 8.0, 8.0, 8.0],
+        "BHP": [10.0, 10.0, 9.0, 9.0, 9.0, 13.0, 13.0, 13.0, 13.0],
+    }
+    for ticker, values in closes.items():
+        for day, close in zip(dates, values):
+            rows.append(
+                {
+                    "date": day,
+                    "ticker": ticker,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "volume": 1_000,
+                }
+            )
+
+    result = run_cross_sectional_momentum(
+        pd.DataFrame(rows),
+        CrossSectionalMomentumParameters(lookback_days=2, top_n=1, max_holding_days=4),
+        entry_start_date=date(2025, 1, 3),
+        entry_end_date=date(2025, 1, 7),
+    )
+
+    assert result.trades
+    first = result.trades[0]
+    assert first.ticker == "CBA"
+    assert first.entry_date == date(2025, 1, 4)
+    assert first.exit_date == date(2025, 1, 8)
+    assert first.holding_days == 4
+
+
 def test_cross_sectional_portfolio_never_exceeds_top_n_open_positions():
     dates = pd.date_range("2025-01-01", periods=8, freq="D")
     rows = []
@@ -116,3 +154,30 @@ def test_position_size_scales_down_after_losses():
     second_allocated = second.shares * second.entry_price
     assert second_allocated < first_allocated
     assert result.final_capital > 0
+
+
+def test_cash_accounting_never_produces_negative_capital():
+    dates = pd.date_range("2025-01-01", periods=12, freq="D")
+    rows = []
+    for ticker, start in {"CBA": 100.0, "BHP": 100.0, "CSL": 100.0}.items():
+        values = [start] + [1.0] * (len(dates) - 1)
+        for day, close in zip(dates, values):
+            rows.append(
+                {
+                    "date": day,
+                    "ticker": ticker,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
+                    "volume": 1_000,
+                }
+            )
+
+    result = run_cross_sectional_momentum(
+        pd.DataFrame(rows),
+        CrossSectionalMomentumParameters(lookback_days=1, top_n=3, max_holding_days=1),
+    )
+
+    assert result.final_capital >= 0.0
+    assert result.total_return_pct >= -100.0
