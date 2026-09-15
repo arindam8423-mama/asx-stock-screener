@@ -17,6 +17,7 @@ class CrossSectionalMomentumParameters:
     lookback_days: int
     top_n: int
     max_holding_days: int
+    volatility_days: int | None = None
 
 
 def _cap_group(ticker: str) -> str:
@@ -35,8 +36,30 @@ def _momentum_ranks(prices: pd.DataFrame, lookback_days: int) -> pd.DataFrame:
     frame["date"] = pd.to_datetime(frame["date"])
     closes = frame.pivot(index="date", columns="ticker", values="close").sort_index()
     returns = closes / closes.shift(lookback_days) - 1.0
-    ranks = returns.rank(axis=1, method="first", ascending=False)
-    return ranks
+    return returns.rank(axis=1, method="first", ascending=False)
+
+
+def _volatility_adjusted_ranks(
+    prices: pd.DataFrame,
+    lookback_days: int,
+    volatility_days: int,
+) -> pd.DataFrame:
+    """Rank trailing return per unit of trailing daily volatility.
+
+    Both components are calculated from closes available before the signal
+    close. The volatility measure is annualisation-free because the same
+    scale is applied to every stock; the ranking is therefore unchanged.
+    """
+    if volatility_days < 2:
+        raise ValueError("volatility_days must be at least 2")
+    frame = prices.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    closes = frame.pivot(index="date", columns="ticker", values="close").sort_index()
+    returns = closes / closes.shift(lookback_days) - 1.0
+    daily_returns = closes.pct_change()
+    volatility = daily_returns.rolling(volatility_days).std()
+    score = returns / volatility.replace(0.0, pd.NA)
+    return score.rank(axis=1, method="first", ascending=False)
 
 
 def _result_from_trades(trades: list[Trade], final_capital: float | None = None) -> BacktestResult:
@@ -74,27 +97,20 @@ def run_cross_sectional_momentum(
     entry_start_date: date | None = None,
     entry_end_date: date | None = None,
 ) -> BacktestResult:
-    """Backtest a long-only cross-sectional momentum portfolio.
-
-    Stocks are ranked at the close using trailing returns. The strongest top N
-    stocks are selected for the next rebalance. Positions are entered at the
-    following session's open and then held for the configured holding period;
-    rankings during that holding period do not trigger daily churn.
-
-    At each rebalance all existing positions are closed at the next session's
-    open before the new top-N portfolio is entered. Position sizing is 10% of
-    current portfolio equity per position, including the buy brokerage inside
-    that allocation. Cash is tracked explicitly and sell brokerage is deducted
-    when positions are closed. The account can therefore never spend more cash
-    than it has or produce an impossible negative balance.
-    """
+    """Backtest a long-only cross-sectional momentum portfolio."""
     if parameters.lookback_days < 1 or parameters.top_n < 1 or parameters.max_holding_days < 1:
         raise ValueError("Momentum parameters must be positive")
+    if parameters.volatility_days is not None and parameters.volatility_days < 2:
+        raise ValueError("volatility_days must be at least 2")
 
     frame = prices.copy()
     frame["date"] = pd.to_datetime(frame["date"])
     frame = frame.sort_values(["date", "ticker"]).reset_index(drop=True)
-    ranks = _momentum_ranks(frame, parameters.lookback_days)
+    ranks = (
+        _momentum_ranks(frame, parameters.lookback_days)
+        if parameters.volatility_days is None
+        else _volatility_adjusted_ranks(frame, parameters.lookback_days, parameters.volatility_days)
+    )
     initial_capital, position_size_pct, buy_brokerage, sell_brokerage = _backtest_config_values()
     cash = initial_capital
     trades: list[Trade] = []
@@ -105,7 +121,6 @@ def run_cross_sectional_momentum(
     }
     common_dates = sorted(frame["date"].unique())
     date_to_index = {pd.Timestamp(value): index for index, value in enumerate(common_dates)}
-
     positions: dict[str, dict[str, object]] = {}
 
     def _row(ticker: str, timestamp: pd.Timestamp) -> pd.Series | None:
@@ -156,7 +171,6 @@ def run_cross_sectional_momentum(
         nonlocal cash
         if not target or cash <= buy_brokerage:
             return
-
         allocation = cash * position_size_pct / 100
         for ticker in target:
             if ticker in positions or cash <= buy_brokerage:
@@ -181,7 +195,6 @@ def run_cross_sectional_momentum(
             }
 
     next_rebalance_signal_index: int | None = None
-
     for signal_index, signal_value in enumerate(common_dates[:-1]):
         signal_timestamp = pd.Timestamp(signal_value)
         signal_date = signal_timestamp.date()
@@ -246,12 +259,14 @@ def run_cross_sectional_momentum(
 
 
 def _grid() -> list[CrossSectionalMomentumParameters]:
+    return [CrossSectionalMomentumParameters(*values) for values in product((5, 10, 20), (1, 3, 5), (5, 10, 15, 20))]
+
+
+def _volatility_grid() -> list[CrossSectionalMomentumParameters]:
     return [
-        CrossSectionalMomentumParameters(*values)
-        for values in product(
-            (5, 10, 20),
-            (1, 3, 5),
-            (5, 10, 15, 20),
+        CrossSectionalMomentumParameters(lookback, top_n, hold, volatility_days)
+        for lookback, top_n, hold, volatility_days in product(
+            (5, 10, 20), (1, 3, 5), (5, 10, 15, 20), (10, 20)
         )
     ]
 
@@ -275,6 +290,39 @@ def _group_metrics(result: BacktestResult) -> dict[str, dict[str, float | int]]:
     return metrics
 
 
+def _optimize_grid(
+    grid: list[CrossSectionalMomentumParameters],
+    prices_dir: Path | None,
+    train_start: date,
+    train_end: date,
+    test_start: date,
+    test_end: date,
+    top_n_results: int,
+    min_trades: int,
+) -> dict[str, object]:
+    prices = load_test_prices(prices_dir)
+    candidates = []
+    for parameters in grid:
+        result = run_cross_sectional_momentum(prices, parameters, train_start, train_end)
+        if len(result.trades) >= min_trades:
+            candidates.append((parameters, result))
+    candidates.sort(key=_sort_key, reverse=True)
+    validation = []
+    for parameters, train_result in candidates[:top_n_results]:
+        test_result = run_cross_sectional_momentum(prices, parameters, test_start, test_end)
+        validation.append({"parameters": parameters, "train": train_result, "test": test_result})
+    return {
+        "grid_size": len(grid),
+        "eligible_candidates": len(candidates),
+        "train_start": train_start,
+        "train_end": train_end,
+        "test_start": test_start,
+        "test_end": test_end,
+        "min_trades": min_trades,
+        "validation": validation,
+    }
+
+
 def optimize_cross_sectional_momentum(
     prices_dir: Path | None = None,
     train_start: date = date(2021, 1, 1),
@@ -286,35 +334,32 @@ def optimize_cross_sectional_momentum(
 ) -> dict[str, object]:
     if train_start >= train_end or train_end >= test_start or test_start > test_end:
         raise ValueError("Invalid train/test date ranges")
-    prices = load_test_prices(prices_dir)
-    candidates: list[tuple[CrossSectionalMomentumParameters, BacktestResult]] = []
-    for parameters in _grid():
-        result = run_cross_sectional_momentum(
-            prices, parameters, entry_start_date=train_start, entry_end_date=train_end
-        )
-        if len(result.trades) >= min_trades:
-            candidates.append((parameters, result))
-    candidates.sort(key=_sort_key, reverse=True)
-    validation = []
-    for parameters, train_result in candidates[:top_n_results]:
-        test_result = run_cross_sectional_momentum(
-            prices, parameters, entry_start_date=test_start, entry_end_date=test_end
-        )
-        validation.append({"parameters": parameters, "train": train_result, "test": test_result})
-    return {
-        "grid_size": len(_grid()),
-        "eligible_candidates": len(candidates),
-        "train_start": train_start,
-        "train_end": train_end,
-        "test_start": test_start,
-        "test_end": test_end,
-        "min_trades": min_trades,
-        "validation": validation,
-    }
+    return _optimize_grid(_grid(), prices_dir, train_start, train_end, test_start, test_end, top_n_results, min_trades)
+
+
+def optimize_volatility_adjusted_momentum(
+    prices_dir: Path | None = None,
+    train_start: date = date(2021, 1, 1),
+    train_end: date = date(2024, 12, 1),
+    test_start: date = date(2025, 1, 1),
+    test_end: date = date(2025, 12, 31),
+    top_n_results: int = 10,
+    min_trades: int = 20,
+) -> dict[str, object]:
+    if train_start >= train_end or train_end >= test_start or test_start > test_end:
+        raise ValueError("Invalid train/test date ranges")
+    return _optimize_grid(_volatility_grid(), prices_dir, train_start, train_end, test_start, test_end, top_n_results, min_trades)
 
 
 def run_cross_sectional_benchmark(prices_dir: Path | None = None) -> dict[str, object]:
     prices = load_test_prices(prices_dir)
-    parameters = CrossSectionalMomentumParameters(lookback_days=20, top_n=3, max_holding_days=20)
+    parameters = CrossSectionalMomentumParameters(20, 3, 20)
+    result = run_cross_sectional_momentum(prices, parameters)
+    return {"parameters": parameters, "overall": result, "by_group": _group_metrics(result)}
+
+
+def run_volatility_adjusted_benchmark(prices_dir: Path | None = None) -> dict[str, object]:
+    prices = load_test_prices(prices_dir)
+    parameters = CrossSectionalMomentumParameters(20, 3, 20, 20)
     result = run_cross_sectional_momentum(prices, parameters)
     return {"parameters": parameters, "overall": result, "by_group": _group_metrics(result)}
