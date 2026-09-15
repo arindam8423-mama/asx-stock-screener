@@ -32,8 +32,8 @@ def main() -> int:
         p = research["parameters"]
         result = research["overall"]
         print("Cross-sectional momentum benchmark")
-        print(f"Parameters: {p.lookback_days}-day relative strength, top {p.top_n}, {p.max_holding_days}-day max hold")
-        print("Assumptions: $10,000 initial capital, 10% position size, $11 buy + $11 sell brokerage")
+        print(f"Parameters: {p.lookback_days}-day relative strength, top {p.top_n}, {p.max_holding_days}-day scheduled rebalance")
+        print("Assumptions: $10,000 initial capital, 10% of current equity per position, $11 buy + $11 sell brokerage")
         print()
         print(f"Trades: {len(result.trades)}")
         print(f"Final capital: ${result.final_capital:,.2f}")
