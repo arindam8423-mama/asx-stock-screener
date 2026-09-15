@@ -50,7 +50,8 @@ def _result_from_trades(trades: list[Trade]) -> BacktestResult:
     for trade in sorted(trades, key=lambda item: item.exit_date):
         equity += trade.net_pnl
         peak = max(peak, equity)
-        max_drawdown = max(max_drawdown, (peak - equity) / peak * 100)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - equity) / peak * 100)
     final_capital = initial_capital + sum(trade.net_pnl for trade in trades)
     return BacktestResult(
         trades=trades,
@@ -78,11 +79,12 @@ def run_cross_sectional_momentum(
     the target portfolio. Any required exits and new entries are executed at the
     following session's open, so the ranking never uses future information.
 
-    Unlike the original ticker-by-ticker implementation, this is a true
-    portfolio construction model: there can never be more than ``top_n`` open
-    positions. A position is replaced when its stock leaves the top N, or when
-    its maximum holding period is reached. Each position uses 10% of the fixed
-    $10,000 research capital and pays $11 buy + $11 sell brokerage.
+    There can never be more than ``top_n`` open positions. A position is
+    replaced when its stock leaves the top N, or when its maximum holding period
+    is reached. Each position targets 10% of *current portfolio equity* and pays
+    $11 buy + $11 sell brokerage. Using current equity prevents the research
+    backtest from repeatedly allocating a fixed $1,000 after losses and ending
+    up with an impossible negative account balance.
     """
     if parameters.lookback_days < 1 or parameters.top_n < 1 or parameters.max_holding_days < 1:
         raise ValueError("Momentum parameters must be positive")
@@ -92,7 +94,7 @@ def run_cross_sectional_momentum(
     frame = frame.sort_values(["date", "ticker"]).reset_index(drop=True)
     ranks = _momentum_ranks(frame, parameters.lookback_days)
     initial_capital, position_size_pct, buy_brokerage, sell_brokerage = _backtest_config_values()
-    allocated = initial_capital * position_size_pct / 100
+    equity = initial_capital
     trades: list[Trade] = []
 
     by_ticker = {
@@ -102,8 +104,6 @@ def run_cross_sectional_momentum(
     common_dates = sorted(frame["date"].unique())
     date_to_index = {pd.Timestamp(value): index for index, value in enumerate(common_dates)}
 
-    # Open positions contain execution-day information. They are deliberately
-    # tracked at portfolio level so the target top-N count is enforced globally.
     positions: dict[str, dict[str, object]] = {}
 
     def _row(ticker: str, timestamp: pd.Timestamp) -> pd.Series | None:
@@ -118,9 +118,6 @@ def run_cross_sectional_momentum(
         signal_date = signal_timestamp.date()
         next_timestamp = pd.Timestamp(common_dates[date_to_index[signal_timestamp] + 1])
 
-        # Signals are only allowed inside the requested entry window. Once a
-        # train/test window ends, existing positions can still be closed, but
-        # no new positions are opened from signals outside that window.
         in_window = (
             (entry_start_date is None or signal_date >= entry_start_date)
             and (entry_end_date is None or signal_date <= entry_end_date)
@@ -130,8 +127,7 @@ def run_cross_sectional_momentum(
         ranked = rank_row.dropna().sort_values().index.tolist()
         target = set(ranked[: parameters.top_n]) if in_window else set()
 
-        # First close positions that are no longer wanted or have reached the
-        # maximum holding period. Execution occurs at the next session open.
+        # Exit first. All exits are executed at the next session's open.
         for ticker in list(positions):
             position = positions[ticker]
             entry_timestamp = pd.Timestamp(position["entry_timestamp"])
@@ -150,6 +146,7 @@ def run_cross_sectional_momentum(
             net_pnl = gross_pnl - brokerage
             return_pct = net_pnl / (entry_price * shares + buy_brokerage) * 100
             exit_date = next_timestamp.date()
+            equity += net_pnl
             trades.append(
                 Trade(
                     ticker=ticker,
@@ -169,10 +166,12 @@ def run_cross_sectional_momentum(
             )
             del positions[ticker]
 
-        # Then fill vacant portfolio slots with the strongest stocks. Entries
-        # are also executed at the next open, after the signal close.
+        # Fill vacant portfolio slots with the strongest stocks. The allocation
+        # is calculated from the latest realized equity after exits, so losses
+        # naturally reduce subsequent position sizes.
         available_slots = max(parameters.top_n - len(positions), 0)
-        if available_slots:
+        if available_slots and equity > 0:
+            allocated = equity * position_size_pct / 100
             for ticker in ranked:
                 if available_slots == 0:
                     break
@@ -195,8 +194,6 @@ def run_cross_sectional_momentum(
                 }
                 available_slots -= 1
 
-    # Close anything still open at the final available close. This is an
-    # end-of-data liquidation rather than a new signal/entry.
     final_timestamp = pd.Timestamp(common_dates[-1])
     for ticker, position in list(positions.items()):
         exit_row = _row(ticker, final_timestamp)
