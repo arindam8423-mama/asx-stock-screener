@@ -13,7 +13,7 @@ def _prices() -> pd.DataFrame:
     dates = pd.date_range("2025-01-01", periods=5, freq="D")
     rows = []
     closes = {
-        "CBA": [10.0, 10.0, 10.0, 12.0, 12.0],
+        "CBA": [10.0, 10.0, 11.0, 12.0, 12.0],
         "BHP": [10.0, 10.0, 10.0, 11.0, 11.0],
     }
     for ticker, values in closes.items():
