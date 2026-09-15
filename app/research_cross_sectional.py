@@ -118,46 +118,47 @@ def _result_from_trades(trades: list[Trade], final_capital: float | None = None)
     )
 
 
+def _row_lookup(prices: pd.DataFrame) -> dict[tuple[pd.Timestamp, str], pd.Series]:
+    frame = prices.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    return {(row.date, row.ticker): row for row in frame.itertuples(index=False)}
+
+
 def run_cross_sectional_momentum(
     prices: pd.DataFrame,
     parameters: CrossSectionalMomentumParameters,
-    entry_start_date: date | None = None,
-    entry_end_date: date | None = None,
+    entry_start: date | None = None,
+    entry_end: date | None = None,
 ) -> BacktestResult:
-    """Backtest long-only cross-sectional momentum with optional trend eligibility."""
-    if parameters.lookback_days < 1 or parameters.top_n < 1 or parameters.max_holding_days < 1:
-        raise ValueError("Momentum parameters must be positive")
-    if parameters.volatility_days is not None and parameters.volatility_days < 2:
-        raise ValueError("volatility_days must be at least 2")
-    if parameters.trend_filter not in TREND_FILTERS:
-        raise ValueError(f"Unknown trend_filter: {parameters.trend_filter}")
-
+    initial_capital, position_size_pct, buy_brokerage, sell_brokerage = _backtest_config_values()
     frame = prices.copy()
     frame["date"] = pd.to_datetime(frame["date"])
-    frame = frame.sort_values(["date", "ticker"]).reset_index(drop=True)
-    ranks = (
-        _momentum_ranks(frame, parameters.lookback_days)
-        if parameters.volatility_days is None
-        else _volatility_adjusted_ranks(frame, parameters.lookback_days, parameters.volatility_days)
-    )
-    ranks = _apply_trend_filter(ranks, _trend_eligibility(frame, parameters.trend_filter))
+    frame = frame.sort_values(["date", "ticker"])
+    common_dates = pd.DatetimeIndex(sorted(frame["date"].unique()))
+    if len(common_dates) < max(parameters.lookback_days, parameters.max_holding_days) + 2:
+        return _result_from_trades([], final_capital=initial_capital)
 
-    initial_capital, position_size_pct, buy_brokerage, sell_brokerage = _backtest_config_values()
-    cash = initial_capital
-    trades: list[Trade] = []
-    by_ticker = {ticker: history.sort_values("date").reset_index(drop=True) for ticker, history in frame.groupby("ticker", sort=True)}
-    common_dates = sorted(frame["date"].unique())
-    date_to_index = {pd.Timestamp(value): index for index, value in enumerate(common_dates)}
+    if parameters.volatility_days is None:
+        ranks = _momentum_ranks(frame, parameters.lookback_days)
+    else:
+        ranks = _volatility_adjusted_ranks(frame, parameters.lookback_days, parameters.volatility_days)
+    if parameters.trend_filter != "none":
+        ranks = _apply_trend_filter(ranks, _trend_eligibility(frame, parameters.trend_filter))
+
+    date_to_index = {timestamp: index for index, timestamp in enumerate(common_dates)}
+    rows = _row_lookup(frame)
     positions: dict[str, dict[str, object]] = {}
-
-    def _row(ticker: str, timestamp: pd.Timestamp) -> pd.Series | None:
-        history = by_ticker[ticker]
-        matches = history.index[history["date"] == timestamp]
-        return history.loc[matches[0]] if len(matches) else None
+    trades: list[Trade] = []
+    cash = initial_capital
 
     def _target_for(signal_timestamp: pd.Timestamp) -> list[str]:
-        rank_row = ranks.loc[signal_timestamp] if signal_timestamp in ranks.index else pd.Series(dtype=float)
-        return rank_row.dropna().sort_values().index.tolist()[: parameters.top_n]
+        if signal_timestamp not in ranks.index:
+            return []
+        ranked = ranks.loc[signal_timestamp].dropna().sort_values()
+        return list(ranked.head(parameters.top_n).index)
+
+    def _row(ticker: str, timestamp: pd.Timestamp):
+        return rows.get((timestamp, ticker))
 
     def _close_positions(exit_timestamp: pd.Timestamp, reason: str) -> None:
         nonlocal cash
@@ -167,13 +168,12 @@ def run_cross_sectional_momentum(
                 continue
             entry_price = float(position["entry_price"])
             shares = float(position["shares"])
-            exit_price = float(exit_row["open"])
+            exit_price = float(exit_row.open)
             gross_pnl = (exit_price - entry_price) * shares
             net_pnl = gross_pnl - sell_brokerage - buy_brokerage
             return_pct = net_pnl / (entry_price * shares + buy_brokerage) * 100
-            holding_days = date_to_index[exit_timestamp] - date_to_index[pd.Timestamp(position["entry_timestamp"])]
             cash += shares * exit_price - sell_brokerage
-            trades.append(Trade(ticker=ticker, cap_group=_cap_group(ticker), entry_date=position["entry_date"], exit_date=exit_timestamp.date(), entry_price=entry_price, exit_price=exit_price, shares=shares, gross_pnl=gross_pnl, brokerage=buy_brokerage + sell_brokerage, net_pnl=net_pnl, return_pct=return_pct, holding_days=holding_days, exit_reason=reason))
+            trades.append(Trade(ticker=ticker, cap_group=_cap_group(ticker), entry_date=position["entry_date"], exit_date=exit_timestamp.date(), entry_price=entry_price, exit_price=exit_price, shares=shares, gross_pnl=gross_pnl, brokerage=buy_brokerage + sell_brokerage, net_pnl=net_pnl, return_pct=return_pct, holding_days=date_to_index[exit_timestamp] - date_to_index[pd.Timestamp(position["entry_timestamp"])], exit_reason=reason))
             del positions[ticker]
 
     def _open_target(target: list[str], entry_timestamp: pd.Timestamp) -> None:
@@ -187,7 +187,7 @@ def run_cross_sectional_momentum(
             entry_row = _row(ticker, entry_timestamp)
             if entry_row is None:
                 continue
-            entry_price = float(entry_row["open"])
+            entry_price = float(entry_row.open)
             spend = min(allocation, cash)
             shares = max((spend - buy_brokerage) / entry_price, 0.0)
             if shares <= 0:
@@ -203,7 +203,7 @@ def run_cross_sectional_momentum(
         signal_timestamp = pd.Timestamp(signal_value)
         signal_date = signal_timestamp.date()
         next_timestamp = pd.Timestamp(common_dates[signal_index + 1])
-        in_window = ((entry_start_date is None or signal_date >= entry_start_date) and (entry_end_date is None or signal_date <= entry_end_date))
+        in_window = ((entry_start is None or signal_date >= entry_start) and (entry_end is None or signal_date <= entry_end))
         if not positions:
             if in_window:
                 _open_target(_target_for(signal_timestamp), next_timestamp)
@@ -228,7 +228,7 @@ def run_cross_sectional_momentum(
                 continue
             entry_price = float(position["entry_price"])
             shares = float(position["shares"])
-            exit_price = float(exit_row["close"])
+            exit_price = float(exit_row.close)
             gross_pnl = (exit_price - entry_price) * shares
             net_pnl = gross_pnl - sell_brokerage - buy_brokerage
             return_pct = net_pnl / (entry_price * shares + buy_brokerage) * 100
@@ -266,7 +266,9 @@ def trend_filter_pass_rates(prices: pd.DataFrame) -> dict[str, float]:
     """Percentage of stock/date observations passing each trend filter."""
     eligibility = {name: _trend_eligibility(prices, name) for name in TREND_FILTERS}
     total = float(eligibility["none"].size)
-    return {name: float(mask.sum() / total * 100) if total else 0.0 for name, mask in eligibility.items()}
+    if total == 0:
+        return {name: 0.0 for name in TREND_FILTERS}
+    return {name: float(mask.to_numpy(dtype=bool).sum() / total * 100) for name, mask in eligibility.items()}
 
 
 def _optimize_grid(grid: list[CrossSectionalMomentumParameters], prices_dir: Path | None, train_start: date, train_end: date, test_start: date, test_end: date, top_n_results: int, min_trades: int) -> dict[str, object]:
@@ -278,26 +280,21 @@ def _optimize_grid(grid: list[CrossSectionalMomentumParameters], prices_dir: Pat
             candidates.append((parameters, result))
     candidates.sort(key=_sort_key, reverse=True)
     validation = [{"parameters": parameters, "train": train_result, "test": run_cross_sectional_momentum(prices, parameters, test_start, test_end)} for parameters, train_result in candidates[:top_n_results]]
-    return {"grid_size": len(grid), "eligible_candidates": len(candidates), "train_start": train_start, "train_end": train_end, "test_start": test_start, "test_end": test_end, "min_trades": min_trades, "validation": validation, "trend_filter_pass_rates": trend_filter_pass_rates(prices)}
-
-
-def optimize_cross_sectional_momentum(prices_dir: Path | None = None, train_start: date = date(2021, 1, 1), train_end: date = date(2024, 12, 1), test_start: date = date(2025, 1, 1), test_end: date = date(2025, 12, 31), top_n_results: int = 10, min_trades: int = 20) -> dict[str, object]:
-    if train_start >= train_end or train_end >= test_start or test_start > test_end:
-        raise ValueError("Invalid train/test date ranges")
-    return _optimize_grid(_grid(), prices_dir, train_start, train_end, test_start, test_end, top_n_results, min_trades)
-
-
-def optimize_volatility_adjusted_momentum(prices_dir: Path | None = None, train_start: date = date(2021, 1, 1), train_end: date = date(2024, 12, 1), test_start: date = date(2025, 1, 1), test_end: date = date(2025, 12, 31), top_n_results: int = 10, min_trades: int = 20) -> dict[str, object]:
-    if train_start >= train_end or train_end >= test_start or test_start > test_end:
-        raise ValueError("Invalid train/test date ranges")
-    return _optimize_grid(_volatility_grid(), prices_dir, train_start, train_end, test_start, test_end, top_n_results, min_trades)
+    return {"candidate_count": len(candidates), "top_results": validation}
 
 
 def run_cross_sectional_benchmark(prices_dir: Path | None = None) -> dict[str, object]:
     prices = load_test_prices(prices_dir)
-    parameters = CrossSectionalMomentumParameters(20, 3, 20)
+    parameters = CrossSectionalMomentumParameters(lookback_days=20, top_n=3, max_holding_days=20)
     result = run_cross_sectional_momentum(prices, parameters)
-    return {"parameters": parameters, "overall": result, "by_group": _group_metrics(result), "trend_filter_pass_rates": trend_filter_pass_rates(prices)}
+    return {"parameters": parameters, "overall": result, "by_group": _group_metrics(result)}
+
+
+def run_volatility_adjusted_benchmark(prices_dir: Path | None = None) -> dict[str, object]:
+    prices = load_test_prices(prices_dir)
+    parameters = CrossSectionalMomentumParameters(lookback_days=20, top_n=3, max_holding_days=20, volatility_days=20)
+    result = run_cross_sectional_momentum(prices, parameters)
+    return {"parameters": parameters, "overall": result, "by_group": _group_metrics(result)}
 
 
 def run_trend_filtered_benchmark(prices_dir: Path | None = None) -> dict[str, object]:
@@ -307,8 +304,9 @@ def run_trend_filtered_benchmark(prices_dir: Path | None = None) -> dict[str, ob
     return {"parameters": parameters, "overall": result, "by_group": _group_metrics(result), "trend_filter_pass_rates": trend_filter_pass_rates(prices)}
 
 
-def run_volatility_adjusted_benchmark(prices_dir: Path | None = None) -> dict[str, object]:
-    prices = load_test_prices(prices_dir)
-    parameters = CrossSectionalMomentumParameters(20, 3, 20, 20)
-    result = run_cross_sectional_momentum(prices, parameters)
-    return {"parameters": parameters, "overall": result, "by_group": _group_metrics(result)}
+def optimize_cross_sectional_momentum(prices_dir: Path | None = None, top_n_results: int = 10, min_trades: int = 20) -> dict[str, object]:
+    return _optimize_grid(_grid(), prices_dir, date(2021, 1, 1), date(2024, 12, 1), date(2025, 1, 1), date(2025, 12, 31), top_n_results, min_trades) | {"trend_filter_pass_rates": trend_filter_pass_rates(load_test_prices(prices_dir))}
+
+
+def optimize_volatility_adjusted_momentum(prices_dir: Path | None = None, top_n_results: int = 10, min_trades: int = 20) -> dict[str, object]:
+    return _optimize_grid(_volatility_grid(), prices_dir, date(2021, 1, 1), date(2024, 12, 1), date(2025, 1, 1), date(2025, 12, 31), top_n_results, min_trades)
