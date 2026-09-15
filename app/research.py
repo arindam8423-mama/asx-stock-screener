@@ -35,6 +35,17 @@ class OptimizationCandidate:
     result: BacktestResult
 
 
+@dataclass(frozen=True)
+class RobustnessSummary:
+    parameter: str
+    value: float | int
+    candidates: int
+    positive_return_count: int
+    profitable_factor_count: int
+    median_return_pct: float
+    median_profit_factor: float
+
+
 def download_test_universe(start: str, end: str, output_dir: Path | None = None) -> int:
     output_dir = output_dir or settings.prices_dir
     failures = 0
@@ -230,6 +241,93 @@ def optimize_mean_reversion(
         "test_start": test_start,
         "test_end": test_end,
         "validation": validation,
+    }
+
+
+def _robustness_summary(
+    candidates: list[tuple[MeanReversionParameters, BacktestResult]],
+    parameter: str,
+) -> list[RobustnessSummary]:
+    grouped: dict[float | int, list[BacktestResult]] = {}
+    for parameters, result in candidates:
+        value = getattr(parameters, parameter)
+        grouped.setdefault(value, []).append(result)
+
+    summaries: list[RobustnessSummary] = []
+    for value, results in sorted(grouped.items(), key=lambda item: item[0]):
+        positive = sum(result.total_return_pct > 0 for result in results)
+        profitable = sum(result.profit_factor > 1.0 for result in results)
+        summaries.append(
+            RobustnessSummary(
+                parameter=parameter,
+                value=value,
+                candidates=len(results),
+                positive_return_count=positive,
+                profitable_factor_count=profitable,
+                median_return_pct=float(pd.Series([r.total_return_pct for r in results]).median()),
+                median_profit_factor=float(pd.Series([r.profit_factor for r in results]).median()),
+            )
+        )
+    return summaries
+
+
+def analyze_mean_reversion_robustness(
+    prices_dir: Path | None = None,
+    test_start: date = date(2025, 1, 1),
+    test_end: date = date(2025, 12, 31),
+    min_trades: int = 20,
+) -> dict[str, object]:
+    """Evaluate every eligible configuration on the untouched test period.
+
+    This is diagnostic only: test results are never used to select a production
+    strategy. The purpose is to determine whether performance is concentrated
+    in one parameter combination or persists across a neighbourhood of values.
+    """
+    if test_start > test_end or min_trades < 1:
+        raise ValueError("Invalid test range or minimum trade count")
+
+    prices = load_test_prices(prices_dir)
+    candidates: list[tuple[MeanReversionParameters, BacktestResult]] = []
+    for parameters in _mean_reversion_grid():
+        result = run_backtest(
+            prices,
+            _mean_reversion_strategy(parameters),
+            TEST_UNIVERSE,
+            _backtest_config(
+                max_holding_days=parameters.max_holding_days,
+                entry_start_date=test_start,
+                entry_end_date=test_end,
+            ),
+        )
+        if len(result.trades) >= min_trades:
+            candidates.append((parameters, result))
+
+    positive = [item for item in candidates if item[1].total_return_pct > 0]
+    profitable = [item for item in candidates if item[1].profit_factor > 1.0]
+    ranked_for_diagnostics = sorted(
+        candidates,
+        key=lambda item: (item[1].profit_factor, item[1].total_return_pct, -item[1].max_drawdown_pct),
+        reverse=True,
+    )
+
+    return {
+        "grid_size": len(_mean_reversion_grid()),
+        "eligible_candidates": len(candidates),
+        "positive_return_count": len(positive),
+        "profitable_factor_count": len(profitable),
+        "median_return_pct": float(pd.Series([r.total_return_pct for _, r in candidates]).median()),
+        "median_profit_factor": float(pd.Series([r.profit_factor for _, r in candidates]).median()),
+        "test_start": test_start,
+        "test_end": test_end,
+        "min_trades": min_trades,
+        "top_diagnostic": [
+            {"parameters": parameters, "result": result}
+            for parameters, result in ranked_for_diagnostics[:10]
+        ],
+        "by_parameter": {
+            parameter: _robustness_summary(candidates, parameter)
+            for parameter in ("lookback_days", "stddevs", "rsi_threshold", "max_holding_days")
+        },
     }
 
 
