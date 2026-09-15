@@ -16,7 +16,7 @@ from app.data.market_data import download_history, load_universe
 from app.data.security_master import build_security_master, save_security_master
 from app.data.storage import MarketDataStore
 from app.data.universe import download_asx_isin_directory, equity_universe, save_universe
-from app.research import download_test_universe, run_momentum_research
+from app.research import download_test_universe, run_momentum_research, run_strategy_comparison
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,6 +39,11 @@ def build_parser() -> argparse.ArgumentParser:
         "backtest-momentum", help="Run the first breakout-momentum strategy on the test basket"
     )
     momentum.add_argument("--prices-dir", type=Path, default=None)
+
+    comparison = subparsers.add_parser(
+        "compare-strategies", help="Run all research strategy families side by side on the test basket"
+    )
+    comparison.add_argument("--prices-dir", type=Path, default=None)
 
     universe = subparsers.add_parser(
         "download-universe", help="Download the current ASX equity candidate universe"
@@ -102,25 +107,59 @@ def download_test_data_command(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
+def _print_result(name: str, result) -> None:
+    print(f"{name}")
+    print(f"  Trades: {len(result.trades)}")
+    print(f"  Final capital: ${result.final_capital:,.2f}")
+    print(f"  Total return: {result.total_return_pct:.2f}%")
+    print(f"  Win rate: {result.win_rate_pct:.2f}%")
+    print(f"  Profit factor: {result.profit_factor:.2f}")
+    print(f"  Max drawdown: {result.max_drawdown_pct:.2f}%")
+    print(f"  Average trade: {result.average_trade_pct:.2f}%")
+    print(f"  Median trade: {result.median_trade_pct:.2f}%")
+    print(f"  Average holding days: {result.average_holding_days:.2f}")
+
+
 def backtest_momentum_command(args: argparse.Namespace) -> int:
     research = run_momentum_research(args.prices_dir)
     result = research["overall"]
     print("Breakout momentum research")
-    print(f"Trades: {len(result.trades)}")
-    print(f"Final capital: ${result.final_capital:,.2f}")
-    print(f"Total return: {result.total_return_pct:.2f}%")
-    print(f"Win rate: {result.win_rate_pct:.2f}%")
-    print(f"Profit factor: {result.profit_factor:.2f}")
-    print(f"Max drawdown: {result.max_drawdown_pct:.2f}%")
-    print(f"Average trade: {result.average_trade_pct:.2f}%")
-    print(f"Median trade: {result.median_trade_pct:.2f}%")
-    print(f"Average holding days: {result.average_holding_days:.2f}")
+    _print_result("", result)
     print("\nBy cap group")
     for group, metrics in research["by_group"].items():
         print(
             f"{group:>5}: trades={metrics['trades']}, "
             f"net_pnl=${metrics['net_pnl']:,.2f}, "
             f"win_rate={metrics['win_rate_pct']:.2f}%"
+        )
+    return 0
+
+
+def compare_strategies_command(args: argparse.Namespace) -> int:
+    comparison = run_strategy_comparison(args.prices_dir)
+    print("Strategy comparison — 15-stock research basket")
+    print("Assumptions: $10,000 initial capital, 10% position size, $11 buy + $11 sell brokerage, 20-day max hold")
+    print()
+    headers = ["Strategy", "Trades", "Final $", "Return", "Win %", "PF", "Max DD", "Avg trade", "Avg days"]
+    print(" | ".join(f"{header:<18}" for header in headers))
+    print("-" * 125)
+    for name, research in comparison.items():
+        result = research["overall"]
+        print(
+            f"{name:<18} | {len(result.trades):>6} | ${result.final_capital:>9,.2f} | "
+            f"{result.total_return_pct:>7.2f}% | {result.win_rate_pct:>6.2f}% | "
+            f"{result.profit_factor:>4.2f} | {result.max_drawdown_pct:>7.2f}% | "
+            f"{result.average_trade_pct:>8.2f}% | {result.average_holding_days:>8.2f}"
+        )
+
+    print("\nNet P&L by cap group")
+    print("Strategy            Large         Mid       Small")
+    print("-" * 55)
+    for name, research in comparison.items():
+        groups = research["by_group"]
+        print(
+            f"{name:<18} ${groups['large']['net_pnl']:>9,.2f} "
+            f"${groups['mid']['net_pnl']:>9,.2f} ${groups['small']['net_pnl']:>9,.2f}"
         )
     return 0
 
@@ -189,6 +228,8 @@ def main() -> int:
         return download_test_data_command(args)
     if args.command == "backtest-momentum":
         return backtest_momentum_command(args)
+    if args.command == "compare-strategies":
+        return compare_strategies_command(args)
     if args.command == "download-universe":
         return download_universe_command(args)
     if args.command == "build-security-master":
