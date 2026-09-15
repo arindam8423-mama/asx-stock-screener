@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pandas as pd
 
@@ -13,27 +13,50 @@ class MeanReversionStrategy:
     stddevs: float = 2.0
     rsi_period: int = 14
     rsi_threshold: float = 30.0
+    _indicator_cache: dict[int, tuple[pd.Series, pd.Series, pd.Series]] = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def _indicators(self, history: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+        """Compute rolling bands and RSI once per history frame.
+
+        The backtest engine calls ``entry_signal`` once per session. Recomputing
+        the complete RSI series on every call makes optimisation unnecessarily
+        quadratic in the number of sessions. Caching these arrays keeps each
+        ticker/parameter combination effectively linear.
+        """
+        key = id(history)
+        cached = self._indicator_cache.get(key)
+        if cached is not None:
+            return cached
+
+        close = history["close"].astype(float)
+        prior_close = close.shift(1)
+        rolling_mean = prior_close.rolling(self.lookback_days).mean()
+        rolling_std = prior_close.rolling(self.lookback_days).std(ddof=0)
+        rsi = _rsi(close, self.rsi_period)
+        indicators = (rolling_mean, rolling_std, rsi)
+        self._indicator_cache[key] = indicators
+        return indicators
 
     def entry_signal(self, history: pd.DataFrame, index: int) -> bool:
         minimum = max(self.lookback_days, self.rsi_period)
         if index < minimum:
             return False
         close = history["close"].astype(float)
-        window = close.iloc[index - self.lookback_days : index]
-        mean = float(window.mean())
-        std = float(window.std(ddof=0))
-        rsi = _rsi(close.iloc[: index + 1], self.rsi_period)
-        if pd.isna(rsi.iloc[-1]):
+        rolling_mean, rolling_std, rsi = self._indicators(history)
+        if pd.isna(rsi.iloc[index]) or pd.isna(rolling_mean.iloc[index]) or pd.isna(rolling_std.iloc[index]):
             return False
-        lower_band = mean - self.stddevs * std
-        return float(close.iloc[index]) < lower_band and float(rsi.iloc[-1]) < self.rsi_threshold
+        lower_band = float(rolling_mean.iloc[index]) - self.stddevs * float(rolling_std.iloc[index])
+        return float(close.iloc[index]) < lower_band and float(rsi.iloc[index]) < self.rsi_threshold
 
     def exit_signal(self, history: pd.DataFrame, entry_index: int, index: int) -> bool:
         if index < self.lookback_days:
             return False
         close = float(history.loc[index, "close"])
-        mean = float(history["close"].iloc[index - self.lookback_days : index].mean())
-        return close >= mean
+        rolling_mean, _, _ = self._indicators(history)
+        mean = rolling_mean.iloc[index]
+        return not pd.isna(mean) and close >= float(mean)
 
 
 @dataclass(frozen=True)
