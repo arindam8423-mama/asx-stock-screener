@@ -88,3 +88,27 @@ def test_cross_sectional_portfolio_never_exceeds_top_n_open_positions():
                 left.entry_date < right.exit_date
                 and right.entry_date < left.exit_date
             ), "top_n=1 must never have overlapping positions"
+
+
+def test_position_size_scales_down_after_losses():
+    dates = pd.date_range("2025-01-01", periods=7, freq="D")
+    prices = pd.DataFrame(
+        {
+            "date": dates,
+            "ticker": ["CBA"] * len(dates),
+            "open": [10.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+            "high": [10.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+            "low": [10.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+            "close": [10.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0],
+            "volume": [1_000] * len(dates),
+        }
+    )
+    result = run_cross_sectional_momentum(
+        prices,
+        CrossSectionalMomentumParameters(lookback_days=1, top_n=1, max_holding_days=1),
+        entry_start_date=date(2025, 1, 2),
+        entry_end_date=date(2025, 1, 5),
+    )
+    assert len(result.trades) >= 2
+    assert result.trades[1].shares < result.trades[0].shares
+    assert result.final_capital > 0
