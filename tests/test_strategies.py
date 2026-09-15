@@ -37,8 +37,10 @@ def test_filtered_breakout_requires_volume_confirmation():
     closes = [10.0] * 20 + [11.0]
     history = _prices(closes)
     history.loc[20, "high"] = 11.0
+    # The test is about volume confirmation, so allow the 10% breakout
+    # volatility through the ATR filter rather than failing on ATR first.
+    strategy = BreakoutVariantStrategy(volume_multiplier=1.25, max_atr_pct=15.0)
     history.loc[20, "volume"] = 1_100
-    strategy = BreakoutVariantStrategy(volume_multiplier=1.25)
     assert not strategy.entry_signal(history, 20)
     history.loc[20, "volume"] = 1_300
     assert strategy.entry_signal(history, 20)
