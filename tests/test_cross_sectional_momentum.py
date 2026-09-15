@@ -110,5 +110,9 @@ def test_position_size_scales_down_after_losses():
         entry_end_date=date(2025, 1, 5),
     )
     assert len(result.trades) >= 2
-    assert result.trades[1].shares < result.trades[0].shares
+    first = result.trades[0]
+    second = result.trades[1]
+    first_allocated = first.shares * first.entry_price
+    second_allocated = second.shares * second.entry_price
+    assert second_allocated < first_allocated
     assert result.final_capital > 0
